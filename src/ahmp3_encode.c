@@ -1,0 +1,922 @@
+/* Layer III encoder: polyphase analysis, MDCT with block switching, a
+   masking model, rate/distortion loops, Huffman coding and the bit
+   reservoir. Constant bit rate. */
+#include "ahmp3_internal.h"
+#include "ahmp3_bitstream.h"
+
+#define MAX_PENDING 32
+#define FIFO_BYTES 16384
+
+/* One granule of one channel waiting to be coded: its 18 x 32 subband
+   samples and what the attack detector saw. */
+typedef struct {
+    float sub[18][32];
+    float energy[18]; /* per time slot, upper subbands */
+} granule_in;
+
+typedef struct {
+    unsigned char head[40]; /* header and side information */
+    int head_bytes;
+    int slot;               /* main data bytes this frame carries */
+} pending;
+
+struct ahmp3_encoder {
+    ahmp3_tables t;
+    int lsf, sr_index, bitrate_index, channels_in, channels, mode;
+    int granules;           /* per frame: 2 (MPEG-1) or 1 */
+    int max_reservoir;      /* bytes main_data_begin can reach back */
+    int frame_base, frame_rest, frame_acc; /* frame size bookkeeping */
+    float cutoff;           /* lowpass, as a fraction of the band */
+
+    /* input and analysis */
+    float X[2][512];        /* polyphase input history */
+    float analysis[32][64]; /* cos((2k + 1)(i - 16) pi / 64) */
+    float in[2][576];
+    int in_len;
+    granule_in queue[4][2]; /* previous, frame granules, lookahead */
+    int queued;
+    int prev_block;         /* block type of the last coded granule */
+    float mdct_cos_long[18][36];
+    float mdct_cos_short[6][12];
+
+    /* masking model */
+    float ath_long[22], ath_short[13];
+    float bark_long[22], bark_short[13];
+    float spread_long[22][22], spread_short[13][13];
+    float prev_xmin[2][22];
+    float pe_average;
+    double full_scale;
+
+    /* output */
+    pending frames[MAX_PENDING];
+    int frame_count;
+    unsigned char fifo[FIFO_BYTES]; /* main data waiting for its frames */
+    int fifo_len;
+    int slots_pending;      /* main data capacity of the queued frames */
+    long long samples_in;
+    int flushed;
+};
+
+/* ---- setup ----------------------------------------------------------------- */
+
+static int find_index(const int *list, int n, int v)
+{
+    for (int i = 0; i < n; i++)
+        if (list[i] == v) return i;
+    return -1;
+}
+
+static double bark(double hz)
+{
+    return 13.0 * atan(0.00076 * hz) + 3.5 * atan((hz / 7500.0) * (hz / 7500.0));
+}
+
+/* Threshold in quiet, dB SPL (Terhardt). */
+static double ath_db(double hz)
+{
+    double f = hz / 1000.0;
+    if (f < 0.02) f = 0.02;
+    if (f > 18) f = 18;
+    return 3.64 * pow(f, -0.8) - 6.5 * exp(-0.6 * (f - 3.3) * (f - 3.3)) + 0.001 * f * f * f * f;
+}
+
+/* Spreading of masking from a band at bark distance dz (maskee - masker), as
+   an energy factor. */
+static double spreading(double dz)
+{
+    double x = dz + 0.474;
+    double db = 15.81 + 7.5 * x - 17.5 * sqrt(1 + x * x);
+    if (db < -60) return 0;
+    return pow(10, db / 10);
+}
+
+static void analyze_slot(ahmp3_encoder *e, int ch, const float *x32, float out[32]);
+static void mdct_long(ahmp3_encoder *e, const float block[36], int type, float out[18]);
+
+/* Energy of the MDCT lines of a full-scale tone, so levels can be read as
+   dB SPL with a full-scale tone at 96 dB. */
+static double calibrate(ahmp3_encoder *e)
+{
+    float slots[36][32];
+    double tone_energy = 0;
+    float saved[512];
+    memcpy(saved, e->X[0], sizeof(saved));
+    memset(e->X[0], 0, sizeof(e->X[0]));
+    for (int n = 0; n < 4 * 576; n += 32) {
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = (float)sin(2 * AHMP3_PI * 1000.0 * (n + i) / ahmp3_sample_rates[e->sr_index]);
+        float s[32];
+        analyze_slot(e, 0, x, s);
+        int slot = (n / 32) % 36;
+        memcpy(slots[slot], s, sizeof(s));
+    }
+    for (int sb = 0; sb < 32; sb++) {
+        float block[36], out[18];
+        for (int i = 0; i < 36; i++) block[i] = slots[i][sb];
+        mdct_long(e, block, 0, out);
+        for (int k = 0; k < 18; k++) tone_energy += (double)out[k] * out[k];
+    }
+    memcpy(e->X[0], saved, sizeof(saved));
+    return tone_energy;
+}
+
+ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
+{
+    if (!c || (c->channels != 1 && c->channels != 2)) return NULL;
+    int sr = find_index(ahmp3_sample_rates, 9, c->sample_rate);
+    if (sr < 0) return NULL;
+    int lsf = sr >= 3;
+    int br = find_index(ahmp3_bitrates[lsf], 15, c->bitrate_kbps);
+    if (br <= 0) return NULL;
+    int channels = c->mode == AHMP3_MONO || c->channels == 1 ? 1 : 2;
+    /* MPEG-1 allows only some bit rates with two channels or one. */
+    if (!lsf && channels == 2 && c->bitrate_kbps < 32) return NULL;
+
+    ahmp3_encoder *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    ahmp3_tables_init(&e->t);
+    e->lsf = lsf;
+    e->sr_index = sr;
+    e->bitrate_index = br;
+    e->channels_in = c->channels;
+    e->channels = channels;
+    e->mode = channels == 1 ? 3 : c->mode == AHMP3_STEREO ? 0 : 1;
+    e->granules = lsf ? 1 : 2;
+    e->max_reservoir = lsf ? 255 : 511;
+    int num = (lsf ? 72000 : 144000) * c->bitrate_kbps;
+    e->frame_base = num / c->sample_rate;
+    e->frame_rest = num % c->sample_rate;
+    e->prev_block = 0;
+
+    for (int k = 0; k < 32; k++)
+        for (int i = 0; i < 64; i++) e->analysis[k][i] = (float)cos((2 * k + 1) * (i - 16) * AHMP3_PI / 64);
+    for (int k = 0; k < 18; k++)
+        for (int n = 0; n < 36; n++) e->mdct_cos_long[k][n] = (float)cos(AHMP3_PI / 72 * (2 * n + 1 + 18) * (2 * k + 1));
+    for (int k = 0; k < 6; k++)
+        for (int n = 0; n < 12; n++) e->mdct_cos_short[k][n] = (float)cos(AHMP3_PI / 24 * (2 * n + 1 + 6) * (2 * k + 1));
+
+    /* Lowpass: fewer bits per channel buy less treble, as other encoders do. */
+    double rate = c->sample_rate, per_channel = (double)c->bitrate_kbps / channels * (channels == 2 && e->mode == 1 ? 1.25 : 1);
+    double hz;
+    if (per_channel >= 160) hz = 20500;
+    else if (per_channel >= 128) hz = 20000;
+    else if (per_channel >= 112) hz = 19500;
+    else if (per_channel >= 96) hz = 18500;
+    else if (per_channel >= 80) hz = 17500;
+    else if (per_channel >= 64) hz = 16500;
+    else if (per_channel >= 56) hz = 15000;
+    else if (per_channel >= 48) hz = 13500;
+    else if (per_channel >= 40) hz = 12000;
+    else if (per_channel >= 32) hz = 10000;
+    else if (per_channel >= 24) hz = 8000;
+    else if (per_channel >= 16) hz = 5500;
+    else hz = 3500;
+    if (hz > rate * 0.48) hz = rate * 0.48;
+    e->cutoff = (float)(hz / (rate / 2));
+
+    e->full_scale = calibrate(e);
+    const short *sl = ahmp3_sfb_long[sr], *ss = ahmp3_sfb_short[sr];
+    for (int b = 0; b < 22; b++) {
+        double lo = sl[b] * rate / 1152, hi = sl[b + 1] * rate / 1152;
+        e->bark_long[b] = (float)bark((lo + hi) / 2);
+        double m = 1e9;
+        for (int j = sl[b]; j < sl[b + 1]; j++) {
+            double db = ath_db((j + 0.5) * rate / 1152);
+            if (db < m) m = db;
+        }
+        e->ath_long[b] = (float)(e->full_scale * pow(10, (m - 96) / 10) * (sl[b + 1] - sl[b]));
+    }
+    for (int b = 0; b < 13; b++) {
+        double lo = ss[b] * rate / 384, hi = ss[b + 1] * rate / 384;
+        e->bark_short[b] = (float)bark((lo + hi) / 2);
+        double m = 1e9;
+        for (int j = ss[b]; j < ss[b + 1]; j++) {
+            double db = ath_db((j + 0.5) * rate / 384);
+            if (db < m) m = db;
+        }
+        /* A short window holds a third of the energy of a long one. */
+        e->ath_short[b] = (float)(e->full_scale / 3 * pow(10, (m - 96) / 10) * (ss[b + 1] - ss[b]));
+    }
+    for (int a = 0; a < 22; a++)
+        for (int b = 0; b < 22; b++) e->spread_long[a][b] = (float)spreading(e->bark_long[a] - e->bark_long[b]);
+    for (int a = 0; a < 13; a++)
+        for (int b = 0; b < 13; b++) e->spread_short[a][b] = (float)spreading(e->bark_short[a] - e->bark_short[b]);
+    for (int ch = 0; ch < 2; ch++)
+        for (int b = 0; b < 22; b++) e->prev_xmin[ch][b] = 1e30f;
+    e->pe_average = 0;
+    return e;
+}
+
+void ahmp3_encoder_free(ahmp3_encoder *e)
+{
+    free(e);
+}
+
+int ahmp3_encoder_delay(const ahmp3_encoder *e)
+{
+    (void)e;
+    /* Analysis filter bank (481 - 529 the decoder counts itself) plus one
+       granule of MDCT overlap; measured by the tests. */
+    return 528;
+}
+
+/* ---- analysis filter bank and MDCT --------------------------------------- */
+
+/* 32 new input samples -> one sample per subband (ISO 11172-3 C.1.3). */
+static void analyze_slot(ahmp3_encoder *e, int ch, const float *x32, float out[32])
+{
+    float *X = e->X[ch];
+    memmove(X + 32, X, (512 - 32) * sizeof(float));
+    for (int i = 0; i < 32; i++) X[31 - i] = x32[i];
+    float Y[64];
+    for (int i = 0; i < 64; i++) {
+        float s = 0;
+        for (int j = 0; j < 8; j++) s += e->t.D[i + 64 * j] * X[i + 64 * j];
+        Y[i] = s / 32;
+    }
+    for (int k = 0; k < 32; k++) {
+        const float *m = e->analysis[k];
+        float s = 0;
+        for (int i = 0; i < 64; i++) s += m[i] * Y[i];
+        out[k] = s;
+    }
+}
+
+static void mdct_long(ahmp3_encoder *e, const float block[36], int type, float out[18])
+{
+    float z[36];
+    for (int n = 0; n < 36; n++) z[n] = block[n] * e->t.win[type][n];
+    for (int k = 0; k < 18; k++) {
+        const float *c = e->mdct_cos_long[k];
+        float s = 0;
+        for (int n = 0; n < 36; n++) s += z[n] * c[n];
+        out[k] = s / 9;
+    }
+}
+
+/* Three short transforms; out holds window w's coefficient k at 3k + w. */
+static void mdct_short(ahmp3_encoder *e, const float block[36], float out[18])
+{
+    for (int w = 0; w < 3; w++) {
+        float z[12];
+        for (int n = 0; n < 12; n++) z[n] = block[6 + 6 * w + n] * e->t.win[2][n];
+        for (int k = 0; k < 6; k++) {
+            const float *c = e->mdct_cos_short[k];
+            float s = 0;
+            for (int n = 0; n < 12; n++) s += z[n] * c[n];
+            out[3 * k + w] = s / 3;
+        }
+    }
+}
+
+/* Spectrum of one granule, in the order the decoder reads it. */
+static void transform(ahmp3_encoder *e, const float prev[18][32], const float cur[18][32], int block_type,
+                      float xr[576])
+{
+    if (block_type != 2) {
+        for (int sb = 0; sb < 32; sb++) {
+            float block[36];
+            for (int i = 0; i < 18; i++) {
+                block[i] = prev[i][sb];
+                block[18 + i] = cur[i][sb];
+            }
+            mdct_long(e, block, block_type, xr + 18 * sb);
+        }
+        /* Undo the decoder's alias reduction butterflies. */
+        for (int sb = 1; sb < 32; sb++) {
+            for (int i = 0; i < 8; i++) {
+                float lo = xr[18 * sb - 1 - i], hi = xr[18 * sb + i];
+                xr[18 * sb - 1 - i] = lo * e->t.cs[i] + hi * e->t.ca[i];
+                xr[18 * sb + i] = hi * e->t.cs[i] - lo * e->t.ca[i];
+            }
+        }
+        return;
+    }
+    float lines[576]; /* by subband: [18 sb + 3k + w] */
+    for (int sb = 0; sb < 32; sb++) {
+        float block[36];
+        for (int i = 0; i < 18; i++) {
+            block[i] = prev[i][sb];
+            block[18 + i] = cur[i][sb];
+        }
+        mdct_short(e, block, lines + 18 * sb);
+    }
+    /* Short spectrum line f of window w sits at 3f + w; the bitstream wants
+       each band's three windows one after another. */
+    const short *ss = ahmp3_sfb_short[e->sr_index];
+    for (int b = 0; b < 13; b++) {
+        int len = ss[b + 1] - ss[b];
+        for (int w = 0; w < 3; w++)
+            for (int j = 0; j < len; j++) xr[3 * ss[b] + w * len + j] = lines[3 * (ss[b] + j) + w];
+    }
+}
+
+/* ---- input ------------------------------------------------------------------ */
+
+/* Turns one granule of input (576 samples per channel) into subband samples
+   and measures how sharply its loudness rises. */
+static void analyze_granule(ahmp3_encoder *e, granule_in *g, int ch, const float *x)
+{
+    for (int t = 0; t < 18; t++) {
+        analyze_slot(e, ch, x + 32 * t, g->sub[t]);
+        /* The decoder negates odd samples of odd subbands; match it here. */
+        if (t & 1)
+            for (int sb = 1; sb < 32; sb += 2) g->sub[t][sb] = -g->sub[t][sb];
+        float energy = 0;
+        for (int sb = 4; sb < 32; sb++) energy += g->sub[t][sb] * g->sub[t][sb];
+        g->energy[t] = energy;
+    }
+}
+
+/* True when a sharp rise in loudness happens within the granule, which a
+   long block would smear into a pre-echo. */
+static bool attack(const granule_in *before, const granule_in *g)
+{
+    float history = 0;
+    for (int t = 0; t < 18; t++) history += before->energy[t];
+    history /= 18;
+    float running = history;
+    for (int t = 0; t < 18; t += 3) {
+        float now = g->energy[t] + g->energy[t + 1] + g->energy[t + 2];
+        now /= 3;
+        if (now > 1e-7f && now > 12 * running) return true;
+        running = 0.6f * running + 0.4f * now;
+    }
+    return false;
+}
+
+/* ---- masking model ---------------------------------------------------------- */
+
+typedef struct {
+    float xmin[22];     /* allowed noise energy per long band */
+    float xmin_s[13][3];
+    float energy[22];
+    float energy_s[13][3];
+    float pe;           /* perceptual entropy: how many bits it wants */
+} mask;
+
+static void mask_long(ahmp3_encoder *e, int ch, const float xr[576], mask *m)
+{
+    const short *sl = ahmp3_sfb_long[e->sr_index];
+    float tonal[22];
+    for (int b = 0; b < 22; b++) {
+        double sum = 0, logsum = 0, peak = 0;
+        int n = sl[b + 1] - sl[b];
+        for (int j = sl[b]; j < sl[b + 1]; j++) {
+            double v = (double)xr[j] * xr[j];
+            sum += v;
+            logsum += log(v + 1e-20);
+            if (v > peak) peak = v;
+        }
+        m->energy[b] = (float)sum;
+        /* Spectral flatness: a peaky band is tonal and masks less. */
+        double flat = n > 1 && sum > 0 ? exp(logsum / n) / (sum / n) : 1;
+        double sfm_db = 10 * log10(flat + 1e-20);
+        double t = sfm_db / -25;
+        tonal[b] = (float)(t < 0 ? 0 : t > 1 ? 1 : t);
+    }
+    m->pe = 0;
+    for (int b = 0; b < 22; b++) {
+        double spread = 0;
+        for (int k = 0; k < 22; k++) spread += m->energy[k] * e->spread_long[b][k];
+        double offset_db = tonal[b] * (14.5 + e->bark_long[b]) + (1 - tonal[b]) * 5.5;
+        if (offset_db < 6) offset_db = 6;
+        double thr = spread * pow(10, -offset_db / 10);
+        /* Pre-echo: the threshold may not jump far above the last one. */
+        if (thr > 2 * e->prev_xmin[ch][b]) thr = 2 * e->prev_xmin[ch][b];
+        e->prev_xmin[ch][b] = (float)thr;
+        if (thr < e->ath_long[b]) thr = e->ath_long[b];
+        m->xmin[b] = (float)thr;
+        if (m->energy[b] > thr) m->pe += (sl[b + 1] - sl[b]) * (float)log2(m->energy[b] / thr) * 0.5f;
+    }
+}
+
+static void mask_short(ahmp3_encoder *e, int ch, const float xr[576], mask *m)
+{
+    const short *ss = ahmp3_sfb_short[e->sr_index];
+    m->pe = 0;
+    for (int w = 0; w < 3; w++) {
+        for (int b = 0; b < 13; b++) {
+            int len = ss[b + 1] - ss[b];
+            double sum = 0;
+            for (int j = 0; j < len; j++) {
+                float v = xr[3 * ss[b] + w * len + j];
+                sum += (double)v * v;
+            }
+            m->energy_s[b][w] = (float)sum;
+        }
+        for (int b = 0; b < 13; b++) {
+            double spread = 0;
+            for (int k = 0; k < 13; k++) spread += m->energy_s[k][w] * e->spread_short[b][k];
+            double thr = spread * pow(10, -7.0 / 10);
+            if (thr < e->ath_short[b]) thr = e->ath_short[b];
+            m->xmin_s[b][w] = (float)thr;
+            if (m->energy_s[b][w] > thr)
+                m->pe += (ss[b + 1] - ss[b]) * (float)log2(m->energy_s[b][w] / thr) * 0.5f;
+        }
+    }
+    /* After a short granule the next long one starts its pre-echo memory fresh. */
+    for (int b = 0; b < 22; b++) e->prev_xmin[ch][b] = 1e30f;
+}
+
+/* ---- quantization ----------------------------------------------------------- */
+
+typedef struct {
+    const float *xr;
+    float xr34[576];  /* |xr|^(3/4) */
+    float xmax34;
+    int cut;          /* lines from here up are zeroed (lowpass) */
+} qin;
+
+/* Quarter-step exponent of each scale factor band's step size. */
+static void band_steps(const ahmp3_encoder *e, const ahmp3_gr *G, int steps[39], int *bands)
+{
+    int shift = G->scalefac_scale + 1, gain = G->global_gain - 210;
+    int n = 0;
+    for (int i = 0; i < G->long_end; i++)
+        steps[n++] = gain - ((G->sf[i] + (G->preflag ? ahmp3_pretab[i] : 0)) << shift);
+    int k = G->long_end;
+    for (int i = G->short_start; i < 13; i++)
+        for (int w = 0; w < 3; w++) steps[n++] = gain - 8 * G->subblock_gain[w] - (G->sf[k++] << shift);
+    *bands = n;
+    (void)e;
+}
+
+/* The lines of band number n (as band_steps counts them). */
+static void band_lines(const ahmp3_encoder *e, const ahmp3_gr *G, int n, int *start, int *end)
+{
+    const short *sl = ahmp3_sfb_long[e->sr_index], *ss = ahmp3_sfb_short[e->sr_index];
+    if (n < G->long_end) {
+        *start = sl[n];
+        *end = sl[n + 1];
+        return;
+    }
+    n -= G->long_end;
+    int b = G->short_start + n / 3, w = n % 3, len = ss[b + 1] - ss[b];
+    *start = 3 * ss[b] + w * len;
+    *end = *start + len;
+}
+
+/* Quantizes with the granule's current gains. False when a value is too big
+   for the bitstream. */
+static bool quantize(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G)
+{
+    int steps[39], bands;
+    band_steps(e, G, steps, &bands);
+    for (int n = 0; n < bands; n++) {
+        int s, t;
+        band_lines(e, G, n, &s, &t);
+        float f = (float)pow(2.0, -3.0 * steps[n] / 16);
+        for (int j = s; j < t; j++) {
+            if (j >= q->cut) {
+                G->ix[j] = 0;
+                continue;
+            }
+            float v = q->xr34[j] * f + 0.4054f;
+            if (v > 8206) return false;
+            int ix = (int)v;
+            G->ix[j] = q->xr[j] < 0 ? -ix : ix;
+        }
+    }
+    return true;
+}
+
+/* Quantization noise energy per band. */
+static void noise(const ahmp3_encoder *e, const qin *q, const ahmp3_gr *G, float out[39])
+{
+    int steps[39], bands;
+    band_steps(e, G, steps, &bands);
+    for (int n = 0; n < bands; n++) {
+        int s, t;
+        band_lines(e, G, n, &s, &t);
+        float f = (float)pow(2.0, steps[n] / 4.0);
+        double sum = 0;
+        for (int j = s; j < t; j++) {
+            int ix = G->ix[j] < 0 ? -G->ix[j] : G->ix[j];
+            double d = fabs(q->xr[j]) - e->t.pow43[ix] * f;
+            sum += d * d;
+        }
+        out[n] = (float)sum;
+    }
+}
+
+/* Bits for this granule with its current values: scale factors plus
+   Huffman data. Also fills in the Huffman side information. */
+static int granule_bits(const ahmp3_encoder *e, ahmp3_gr *G, bool best_split)
+{
+    if (!ahmp3_choose_scalefac_compress(G, e->lsf)) return 1 << 20;
+    return ahmp3_part2_bits(G, e->lsf, false, NULL) + ahmp3_huffman_choose(G, e->sr_index, best_split);
+}
+
+/* Inner loop: the finest global gain whose bits fit. */
+static int fit_gain(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G, int target)
+{
+    int lo = 0, hi = 255, best = 255;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        G->global_gain = mid;
+        if (quantize(e, q, G) && granule_bits(e, G, false) <= target) {
+            best = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    G->global_gain = best;
+    quantize(e, q, G);
+    return granule_bits(e, G, false);
+}
+
+/* Outer loop: shapes the noise under the masking threshold by raising the
+   scale factors of bands that are too noisy, keeping the best attempt. */
+static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, ahmp3_gr *G, int target)
+{
+    qin q;
+    q.xr = xr;
+    q.xmax34 = 0;
+    q.cut = G->block_type == 2 ? 576 : (int)(e->cutoff * 576);
+    for (int j = 0; j < 576; j++) {
+        q.xr34[j] = (float)pow(fabs(xr[j]), 0.75);
+        if (q.xr34[j] > q.xmax34) q.xmax34 = q.xr34[j];
+    }
+    if (G->block_type == 2) {
+        /* Short blocks: the lowpass applies within each window. */
+        const short *ss = ahmp3_sfb_short[e->sr_index];
+        int cut = (int)(e->cutoff * 192);
+        for (int b = 0; b < 13; b++) {
+            int len = ss[b + 1] - ss[b];
+            for (int w = 0; w < 3; w++)
+                for (int j = 0; j < len; j++)
+                    if (ss[b] + j >= cut) q.xr34[3 * ss[b] + w * len + j] = 0;
+        }
+    }
+    memset(G->sf, 0, sizeof(G->sf));
+    G->scalefac_scale = 0;
+    G->preflag = 0;
+    if (target > 4095) target = 4095;
+    if (q.xmax34 == 0 || target < 16) {
+        memset(G->ix, 0, sizeof(G->ix));
+        G->global_gain = 0;
+        G->part23 = granule_bits(e, G, true);
+        return;
+    }
+
+    float xmin[39];
+    int bands = 0, steps[39];
+    band_steps(e, G, steps, &bands);
+    for (int n = 0; n < bands; n++) {
+        if (n < G->long_end) {
+            xmin[n] = m->xmin[n];
+        } else {
+            int k = n - G->long_end, b = G->short_start + k / 3;
+            xmin[n] = m->xmin_s[b][k % 3];
+        }
+        if (xmin[n] < 1e-20f) xmin[n] = 1e-20f;
+    }
+    /* Band 21 (12 for short) has no scale factor; its noise is not counted. */
+    int counted = G->long_end == 22 ? 21 : bands - 3;
+
+    ahmp3_gr best = *G;
+    int best_over = 1 << 30;
+    double best_over_db = 1e30;
+    for (int iter = 0; iter < 40; iter++) {
+        fit_gain(e, &q, G, target);
+        float nz[39];
+        noise(e, &q, G, nz);
+        int over = 0;
+        double over_db = 0;
+        for (int n = 0; n < counted; n++) {
+            if (nz[n] > xmin[n]) {
+                over++;
+                over_db += 10 * log10(nz[n] / xmin[n]);
+            }
+        }
+        if (over < best_over || (over == best_over && over_db < best_over_db)) {
+            best = *G;
+            best_over = over;
+            best_over_db = over_db;
+        }
+        if (!over) break;
+
+        /* Amplify the noisy bands. */
+        bool changed = false, all = true;
+        int limit = 0;
+        for (int n = 0; n < counted; n++) {
+            if (nz[n] > xmin[n]) {
+                G->sf[n]++;
+                changed = true;
+            } else {
+                all = false;
+            }
+        }
+        for (int n = 0; n < counted; n++)
+            if (G->sf[n] > ahmp3_sf_limit(G, e->lsf, n)) limit++;
+        if (limit) {
+            if (G->scalefac_scale) break;
+            /* Coarser scale factor steps reach twice as far. */
+            G->scalefac_scale = 1;
+            for (int n = 0; n < bands; n++) G->sf[n] = (unsigned char)((G->sf[n] + 1) / 2);
+        }
+        if (!changed || all) break;
+    }
+    *G = best;
+    quantize(e, &q, G);
+    G->part23 = granule_bits(e, G, true);
+}
+
+/* ---- frames ------------------------------------------------------------------ */
+
+static int frame_bytes_next(ahmp3_encoder *e, int *padding)
+{
+    e->frame_acc += e->frame_rest;
+    int sr = ahmp3_sample_rates[e->sr_index];
+    *padding = 0;
+    if (e->frame_acc >= sr) {
+        e->frame_acc -= sr;
+        *padding = 1;
+    }
+    return e->frame_base + *padding;
+}
+
+/* Moves finished frames to out. A frame is finished once the main data
+   that fills its slot is known. */
+static size_t emit(ahmp3_encoder *e, uint8_t *out, size_t cap, bool all)
+{
+    size_t written = 0;
+    int used = 0;
+    int i = 0;
+    for (; i < e->frame_count; i++) {
+        pending *p = &e->frames[i];
+        if (!all && e->fifo_len - used < p->slot) break;
+        if (written + (size_t)p->head_bytes + (size_t)p->slot > cap) break;
+        memcpy(out + written, p->head, (size_t)p->head_bytes);
+        written += (size_t)p->head_bytes;
+        int have = e->fifo_len - used;
+        int take = have < p->slot ? have : p->slot;
+        memcpy(out + written, e->fifo + used, (size_t)take);
+        memset(out + written + take, 0, (size_t)(p->slot - take));
+        written += (size_t)p->slot;
+        used += take;
+        e->slots_pending -= p->slot;
+    }
+    memmove(e->frames, e->frames + i, (size_t)(e->frame_count - i) * sizeof(pending));
+    e->frame_count -= i;
+    memmove(e->fifo, e->fifo + used, (size_t)(e->fifo_len - used));
+    e->fifo_len -= used;
+    return written;
+}
+
+static void ms_decision(ahmp3_encoder *e, float xr[2][576], const mask m[2], bool shortb, bool *use_ms)
+{
+    *use_ms = false;
+    if (e->mode != 1) return;
+    /* Mid/side pays off when the channels are alike: compare how much
+       signal stands above the threshold each way. */
+    double lr = 0, ms = 0;
+    for (int j = 0; j < 576; j++) {
+        double l = xr[0][j], r = xr[1][j];
+        double mid = (l + r) * 0.70710678, side = (l - r) * 0.70710678;
+        lr += log1p(fabs(l) * 1000) + log1p(fabs(r) * 1000);
+        ms += log1p(fabs(mid) * 1000) + log1p(fabs(side) * 1000);
+    }
+    (void)m;
+    (void)shortb;
+    *use_ms = ms < lr * 0.95;
+}
+
+static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
+{
+    (void)dummy;
+    ahmp3_fr fr;
+    memset(&fr, 0, sizeof(fr));
+    int padding;
+    int bytes = frame_bytes_next(e, &padding);
+    fr.lsf = e->lsf;
+    fr.sr_index = e->sr_index;
+    fr.bitrate_index = e->bitrate_index;
+    fr.padding = padding;
+    fr.mode = e->mode;
+    fr.channels = e->channels;
+    fr.granules = e->granules;
+    int side = e->lsf ? (e->channels == 1 ? 9 : 17) : (e->channels == 1 ? 17 : 32);
+    int slot = bytes - 4 - side;
+
+    /* Reservoir: bytes queued for earlier frames' slots that are still free. */
+    int free_before = e->slots_pending - e->fifo_len;
+    if (free_before > e->max_reservoir) {
+        int stuff = free_before - e->max_reservoir;
+        memset(e->fifo + e->fifo_len, 0, (size_t)stuff);
+        e->fifo_len += stuff;
+        free_before = e->max_reservoir;
+    }
+    fr.main_data_begin = free_before;
+    int budget = (free_before + slot) * 8;
+
+    /* Spectra and masking for every granule and channel. */
+    float xr[2][2][576];
+    mask m[2][2];
+    for (int g = 0; g < e->granules; g++) {
+        granule_in *cur = e->queue[1 + g];
+        float (*prev)[32];
+        for (int ch = 0; ch < e->channels; ch++) {
+            prev = e->queue[g][ch].sub;
+            transform(e, (const float (*)[32])prev, (const float (*)[32])cur[ch].sub, block_types[g], xr[g][ch]);
+            if (block_types[g] == 2) mask_short(e, ch, xr[g][ch], &m[g][ch]);
+            else mask_long(e, ch, xr[g][ch], &m[g][ch]);
+        }
+    }
+    bool ms = false;
+    if (e->channels == 2) {
+        float both[2][576];
+        memcpy(both[0], xr[0][0], sizeof(both[0]));
+        memcpy(both[1], xr[0][1], sizeof(both[1]));
+        ms_decision(e, both, m[0], block_types[0] == 2, &ms);
+    }
+    fr.mode_ext = ms ? 2 : 0;
+    if (ms) {
+        for (int g = 0; g < e->granules; g++) {
+            for (int j = 0; j < 576; j++) {
+                float l = xr[g][0][j], r = xr[g][1][j];
+                xr[g][0][j] = (l + r) * 0.70710678f;
+                xr[g][1][j] = (l - r) * 0.70710678f;
+            }
+            for (int b = 0; b < 22; b++) {
+                float t = m[g][0].xmin[b] < m[g][1].xmin[b] ? m[g][0].xmin[b] : m[g][1].xmin[b];
+                m[g][0].xmin[b] = m[g][1].xmin[b] = t;
+            }
+            for (int b = 0; b < 13; b++)
+                for (int w = 0; w < 3; w++) {
+                    float t = m[g][0].xmin_s[b][w] < m[g][1].xmin_s[b][w] ? m[g][0].xmin_s[b][w] : m[g][1].xmin_s[b][w];
+                    m[g][0].xmin_s[b][w] = m[g][1].xmin_s[b][w] = t;
+                }
+        }
+    }
+
+    /* Share the bits: an even split, moved toward the granules and channels
+       that need more, while keeping some reservoir for hard passages. */
+    int parts = e->granules * e->channels;
+    float pe_total = 0;
+    for (int g = 0; g < e->granules; g++)
+        for (int ch = 0; ch < e->channels; ch++) pe_total += m[g][ch].pe;
+    float mean_bits = slot * 8.0f / parts;
+    float pe_mean = pe_total / parts;
+    e->pe_average = e->pe_average ? 0.9f * e->pe_average + 0.1f * pe_mean : pe_mean;
+    int extra = free_before * 8;
+    float want_extra = pe_mean > e->pe_average * 1.1f ? (float)extra * 0.6f : (float)extra * 0.15f;
+    int remaining = budget;
+    for (int g = 0; g < e->granules; g++) {
+        for (int ch = 0; ch < e->channels; ch++) {
+            float share = pe_total > 0 ? m[g][ch].pe / pe_total : 1.0f / parts;
+            float evenly = 1.0f / parts;
+            int target = (int)(mean_bits + want_extra * (0.5f * share + 0.5f * evenly));
+            int left_parts = (e->granules - g) * e->channels - ch;
+            int cap = remaining - (left_parts - 1) * 8;
+            if (target > cap) target = cap;
+            if (target > 4095) target = 4095;
+            if (target < 0) target = 0;
+            ahmp3_gr *G = &fr.gr[g][ch];
+            memset(G, 0, sizeof(*G));
+            G->block_type = block_types[g];
+            G->window_switching = block_types[g] != 0;
+            G->long_end = block_types[g] == 2 ? 0 : 22;
+            G->short_start = block_types[g] == 2 ? 0 : 13;
+            code_granule(e, xr[g][ch], &m[g][ch], G, target);
+            remaining -= G->part23;
+        }
+    }
+    /* Never more than the frame can carry: silence granules from the end
+       until it fits. Only a pathological input could need this. */
+    for (int i = parts - 1; i >= 0 && remaining < 0; i--) {
+        ahmp3_gr *G = &fr.gr[i / e->channels][i % e->channels];
+        remaining += G->part23;
+        memset(G->ix, 0, sizeof(G->ix));
+        memset(G->sf, 0, sizeof(G->sf));
+        G->global_gain = 0;
+        G->scalefac_scale = 0;
+        G->part23 = granule_bits(e, G, true);
+        remaining -= G->part23;
+    }
+
+    unsigned char main[4096];
+    int main_bits = ahmp3_write_main(&fr, main, sizeof(main));
+    int main_bytes = (main_bits + 7) / 8;
+    pending *p = &e->frames[e->frame_count++];
+    p->head_bytes = ahmp3_write_header(&fr, p->head);
+    p->slot = slot;
+    e->slots_pending += slot;
+    memcpy(e->fifo + e->fifo_len, main, (size_t)main_bytes);
+    e->fifo_len += main_bytes;
+}
+
+/* Codes the oldest frame of the queue once its lookahead granule is in. */
+static size_t step(ahmp3_encoder *e, uint8_t *out, size_t cap)
+{
+    if (e->queued < e->granules + 1) return 0;
+
+    /* Block types: short around attacks, with start and stop windows to
+       switch in and out. Both channels share them so mid/side stays valid. */
+    bool shortb[3];
+    for (int g = 0; g <= e->granules; g++) {
+        shortb[g] = false;
+        for (int ch = 0; ch < e->channels; ch++)
+            if (attack(&e->queue[g][ch], &e->queue[1 + g][ch])) shortb[g] = true;
+    }
+    int types[2];
+    int prev = e->prev_block;
+    for (int g = 0; g < e->granules; g++) {
+        bool next_short = shortb[g + 1];
+        bool prev_short = prev == 2;
+        if (shortb[g] || (prev_short && next_short)) types[g] = 2;
+        else if (next_short) types[g] = 1;
+        else if (prev_short) types[g] = 3;
+        else types[g] = 0;
+        /* A start window must lead into a short block. */
+        if (prev == 1 && types[g] != 2) types[g] = 2;
+        prev = types[g];
+    }
+    e->prev_block = prev;
+
+    /* A caller that gives no room for output must not overflow the queue:
+       the oldest frame is dropped instead. */
+    while (e->frame_count >= MAX_PENDING - 1 || e->fifo_len > FIFO_BYTES - 4096) {
+        int take = e->frames[0].slot < e->fifo_len ? e->frames[0].slot : e->fifo_len;
+        memmove(e->fifo, e->fifo + take, (size_t)(e->fifo_len - take));
+        e->fifo_len -= take;
+        e->slots_pending -= e->frames[0].slot;
+        memmove(e->frames, e->frames + 1, (size_t)(e->frame_count - 1) * sizeof(pending));
+        e->frame_count--;
+    }
+    code_frame(e, types, NULL);
+
+    /* Slide the queue: the last granule coded becomes the one before the
+       next frame, and the lookahead granule its first. */
+    memcpy(e->queue[0], e->queue[e->granules], sizeof(e->queue[0]));
+    memcpy(e->queue[1], e->queue[e->granules + 1], sizeof(e->queue[0]));
+    e->queued = 1;
+    return emit(e, out, cap, false);
+}
+
+/* queue[0] is the granule before the next frame, queue[1..granules] the
+   frame, queue[granules + 1] the lookahead. */
+static size_t push(ahmp3_encoder *e, uint8_t *out, size_t cap)
+{
+    int slot = ++e->queued;
+    for (int ch = 0; ch < e->channels; ch++) analyze_granule(e, &e->queue[slot][ch], ch, e->in[ch]);
+    e->in_len = 0;
+    return step(e, out, cap);
+}
+
+/* Input outside [-2, 2], or not a number, is clipped or silenced. */
+static float clean(float v)
+{
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u) return 0; /* NaN or infinity (checked by bits: fast math) */
+    return v > 2 ? 2 : v < -2 ? -2 : v;
+}
+
+size_t ahmp3_encode(ahmp3_encoder *e, const float *pcm, size_t samples, uint8_t *out, size_t out_cap)
+{
+    size_t written = 0;
+    for (size_t i = 0; i < samples; i++) {
+        if (e->channels == 1) {
+            float v = clean(pcm[i * e->channels_in]);
+            if (e->channels_in == 2) v = (v + clean(pcm[i * 2 + 1])) * 0.5f;
+            e->in[0][e->in_len] = v;
+        } else {
+            e->in[0][e->in_len] = clean(pcm[i * e->channels_in]);
+            e->in[1][e->in_len] = clean(pcm[i * e->channels_in + (e->channels_in == 2 ? 1 : 0)]);
+        }
+        if (++e->in_len == 576) written += push(e, out + written, out_cap - written);
+    }
+    e->samples_in += (long long)samples;
+    return written;
+}
+
+size_t ahmp3_encode_s16(ahmp3_encoder *e, const int16_t *pcm, size_t samples, uint8_t *out, size_t out_cap)
+{
+    float buf[1024];
+    size_t written = 0;
+    size_t per = 1024 / (size_t)e->channels_in;
+    for (size_t i = 0; i < samples; i += per) {
+        size_t n = samples - i < per ? samples - i : per;
+        for (size_t j = 0; j < n * (size_t)e->channels_in; j++) buf[j] = pcm[i * e->channels_in + j] / 32768.0f;
+        written += ahmp3_encode(e, buf, n, out + written, out_cap - written);
+    }
+    return written;
+}
+
+size_t ahmp3_encoder_flush(ahmp3_encoder *e, uint8_t *out, size_t out_cap)
+{
+    size_t written = 0;
+    if (!e->flushed) {
+        e->flushed = 1;
+        /* Enough silence to carry the last input through the filter bank,
+           the lookahead granule and the last frame. */
+        float zero[2 * 576] = {0};
+        int granules = 4 + e->granules;
+        for (int i = 0; i < granules; i++) written += ahmp3_encode(e, zero, 576, out + written, out_cap - written);
+    }
+    written += emit(e, out + written, out_cap - written, true);
+    return written;
+}
