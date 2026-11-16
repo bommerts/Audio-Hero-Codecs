@@ -1,9 +1,10 @@
 # Audio Hero Codecs
 
-Audio decoders and an MP3 encoder in plain C, written from the published
-standards with no dependencies beyond the C standard library. They were built
-for the Audio Hero Companion, which streams music to network audio devices,
-and are published here for anyone to use.
+Audio decoders, an MP3 encoder, a sample rate converter and a mix to stereo
+in plain C, written from the published standards with no dependencies beyond
+the C standard library. They were built for the Audio Hero Companion, which
+streams music to network audio devices, and are published here for anyone to
+use.
 
 | Format | Decode | Encode | Header |
 | --- | --- | --- | --- |
@@ -12,6 +13,14 @@ and are published here for anyone to use.
 | FLAC | yes | | `ahflac.h` |
 | AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
 | WAV | yes | | `ahwav.h` |
+
+Around them:
+
+| | Header |
+| --- | --- |
+| One reader for all of the above: tells the kind, decodes, trims, seeks | `ahreader.h` |
+| Sample rate conversion, any rate to any rate | `ahresample.h` |
+| Mixing 1 to 8 channels to stereo | `ahmix.h` |
 
 The repository was first named Audio-Hero-MP3, when it held MP3 alone. Links
 to the old name still work.
@@ -74,9 +83,31 @@ to the old name still work.
 - Files whose length was never filled in (streams) are read to their end
 - Not read: compressed kinds of WAV (ADPCM, A-law, mu-law)
 
+**One reader for every format**
+- Tells the kind of file from its contents, not its name
+- Decodes a piece at a time through a read function you supply, so a file
+  of any size plays in a small, fixed amount of memory
+- Drops the run-in and padding of gapless MP3 and M4A files, so each file
+  gives exactly its own sound
+- Says how long the file is, and seeks to the sample
+
+**Sample rate converter**
+- Any rate from 1 to 768 kHz to any other, 1 to 8 channels, fed a piece at
+  a time
+- A windowed-sinc filter worked out for the two rates: sound up to 90.7% of
+  the lower rate's half (20 kHz when either rate is 44.1 kHz) passes
+  unchanged, and everything the lower rate cannot carry is removed
+- The output lines up with the input to the sample, with no delay to
+  account for
+
+**Mix to stereo**
+- One channel goes to both sides as it is; more than two are mixed down by
+  where each speaker stands, with the bass effects channel left out, and
+  turned down just far enough that the mix cannot clip
+
 ## How it is checked
 
-`tests/` runs about 2,700 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 3,700 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
@@ -97,9 +128,27 @@ ffmpeg as an independent reference:
 - **Gapless.** Trimming by the header must match ffmpeg's to the sample, for
   LAME's files, for this encoder's files (which must come back exactly as
   long as the input, down to a file of one sample), and for M4A files.
+- **The reader.** Files of every kind must come out as ffmpeg decodes them,
+  to the same length; the length the reader states must be the length it
+  gives; and a seek to any sample must give what a read from the start
+  gives there (exactly for FLAC and WAV, to floating point precision for
+  the rest).
+- **Sample rate conversion against the mathematics.** A tone resampled is
+  the same tone at the new rate. For 18 pairs of rates, tones across the
+  kept band must come out within 94 dB of that ideal (a level error under
+  0.001 dB), and tones the new rate cannot carry must come out at least
+  94 dB down. Feeding the sound in pieces of any size must not change a
+  single sample.
+- **Sample rate conversion against ffmpeg.** On band-limited test sound the
+  output must match both of ffmpeg's resamplers (its own, and soxr at its
+  most exact) within 86 dB of the sound, sample for sample.
+- **Mixing down.** For each usual layout from 3 to 8 channels the mix must
+  match ffmpeg's default mix within two steps of 16 bits.
 - **Damage.** Damaged, cut-off and random input must never crash a decoder
   or make it produce more than the file could hold; frames with a failed CRC
-  must be caught. The whole suite also runs under AddressSanitizer.
+  must be caught. Sound that is not sound (NaN, infinity) must leave the
+  sample rate converter as soon as its filter has passed it. The whole suite
+  also runs under AddressSanitizer.
 
 Formats ffmpeg cannot help with are checked against themselves: free-format
 streams must decode to the same sound as the same frames with a stated bit
@@ -127,6 +176,9 @@ rate.
 - **AAC after a damaged frame.** ffmpeg carries on with what the frame
   before the bad one left behind; this decoder starts the next frame from
   silence.
+- **Mono to stereo.** ffmpeg plays a one-channel file 3 dB down on each
+  side. The mix here puts it on both sides as it is, so a mono file is no
+  quieter than a stereo one.
 
 Encoders in common use write none of these, so files play the same in both.
 
@@ -153,6 +205,7 @@ On one core of a desktop PC:
 | AAC decode | 650 |
 | FLAC decode (16-bit, 44.1 kHz) | 1000 |
 | MP3 encode | 50 to 100 |
+| Sample rate conversion, 48 to 44.1 kHz stereo | 500 |
 
 ## Using it
 
@@ -212,9 +265,38 @@ for (uint64_t i = 0; i < info->packets; i++) {
 /* info->delay and info->samples say what to keep for gapless playback. */
 ```
 
+Or let the reader pick the decoder, and bring whatever the file holds to
+44.1 kHz stereo:
+
+```c
+#include "ahreader.h"
+#include "ahmix.h"
+#include "ahresample.h"
+
+ahreader *r = ahreader_open(my_read_function, my_file, file_size, &error);
+const ahreader_info *info = ahreader_get_info(r); /* kind, rate, channels, length */
+ahmix mix;
+ahmix_init(&mix, info->channels, info->channel_mask);
+ahresample *rs = ahresample_new(info->sample_rate, 44100, 2);
+
+float pcm[8 * 1024], out[2 * 1024];
+size_t n, used, made;
+while ((n = ahreader_read(r, pcm, 1024)) != 0) {
+    ahmix_to_stereo(&mix, pcm, n, pcm);
+    for (size_t pos = 0; pos < n; pos += used) {
+        made = ahresample_process(rs, pcm + 2 * pos, n - pos, &used, out, 1024);
+        /* `made` stereo samples at 44.1 kHz are in out */
+    }
+}
+while ((made = ahresample_flush(rs, out, 1024)) != 0) { /* the last of it */ }
+ahreader_seek(r, 30 * (uint64_t)info->sample_rate); /* to 0:30 */
+```
+
 Each header documents its whole interface: [ahmp3.h](include/ahmp3.h),
 [ahflac.h](include/ahflac.h), [ahaac.h](include/ahaac.h),
-[ahm4a.h](include/ahm4a.h), [ahwav.h](include/ahwav.h).
+[ahm4a.h](include/ahm4a.h), [ahwav.h](include/ahwav.h),
+[ahreader.h](include/ahreader.h), [ahresample.h](include/ahresample.h),
+[ahmix.h](include/ahmix.h).
 
 There is also a small command line tool. It tells the kind of file from its
 contents:
@@ -223,7 +305,11 @@ contents:
 ahmp3 decode in.flac out.wav
 ahmp3 encode in.m4a out.mp3 --bitrate 192
 ahmp3 encode in.wav out.mp3 --vbr 8
+ahmp3 encode surround96k.flac out.mp3 --rate 44100
 ```
+
+Encoding mixes more than two channels down to stereo, and changes the sample
+rate when MP3 has no such rate or `--rate` asks for one.
 
 ## Building
 
@@ -246,11 +332,15 @@ take just the files you need:
 | AAC | `ahaac_decode.c`, `ahaac_tables.c` |
 | M4A | `ahm4a.c` |
 | WAV | `ahwav.c` |
+| The reader | `ahreader.c` and all of the decoders |
+| Sample rate conversion | `ahresample.c` |
+| Mixing to stereo | `ahmix.c` |
 
 ## Not done
 
-- No sample rate conversion: a decoder gives the file's own rate, and the
-  MP3 encoder takes only the rates MP3 has (8 to 48 kHz).
+- The length of an MP3 file that carries no length header is worked out
+  from its size and bit rate, which is only right when the bit rate is
+  constant. A seek in such a file is still exact.
 - HE-AAC (SBR and parametric stereo), AAC with more than two channels, and
   Apple Lossless.
 - FLAC inside Ogg; the MD5 check of a whole FLAC file.

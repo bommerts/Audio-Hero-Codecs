@@ -20,6 +20,8 @@ typedef struct {
     int bits;         /* per sample as stored: 8, 16, 24, 32 or 64 */
     bool is_float;
     uint64_t samples; /* per channel in the file; 0 when the file does not say */
+    uint32_t channel_mask; /* which speaker each channel is for, from an
+                              extensible header; 0 when the file does not say */
 } ahwav_format;
 
 typedef struct ahwav_decoder ahwav_decoder;
@@ -39,6 +41,13 @@ void ahwav_decoder_free(ahwav_decoder *d);
    format (optional) is filled in once the header has been read. */
 size_t ahwav_decode(ahwav_decoder *d, const uint8_t *data, size_t len, bool eof, float *pcm, size_t pcm_cap,
                     int *samples, ahwav_format *format);
+
+/* For a seek, once the header has been read: tells where in the file sample
+   `sample` (per channel, from 0) lies, and from then on expects the data
+   from that place. False before the header is read, or when the file is
+   known to be shorter. The offset counts from the first byte ever handed
+   to ahwav_decode, so hand it the file from its start. */
+bool ahwav_decoder_seek(ahwav_decoder *d, uint64_t sample, uint64_t *offset);
 
 /* NULL while all is well; otherwise why the file cannot be read (not a WAV
    file, or a kind of WAV this reader does not handle). */

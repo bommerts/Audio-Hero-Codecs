@@ -100,6 +100,7 @@ ahmp3_decoder *ahmp3_decoder_new(void)
 {
     ahmp3_decoder *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
+    d->info.encoder_delay = d->info.encoder_padding = -1; /* not given, until a header says */
     ahmp3_tables_init(&d->t);
     for (int i = 0; i < 64; i++)
         for (int k = 0; k < 32; k++)

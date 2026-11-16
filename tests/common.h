@@ -66,5 +66,10 @@ void test_wav(void);
 void test_flac(void);
 void test_layers(void);
 void test_aac(void);
+void test_convert(void);
+void test_reader(void);
+
+/* A read function over a file held in memory: user is its `bytes`. */
+size_t test_memory_read(void *user, uint64_t offset, void *buffer, size_t n);
 
 #endif

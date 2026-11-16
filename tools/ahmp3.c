@@ -1,13 +1,14 @@
 /* Command line tool.
-     ahmp3 decode <in> <out.wav> [--raw-float] [--no-trim]
-     ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono]
+     ahmp3 decode <in> <out.wav> [--raw-float]
+     ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono] [--rate 44100]
    <in> is an MP3 (or MPEG Layer I or II), WAV, FLAC, AAC (ADTS) or M4A file;
-   its kind is told from its contents. */
-#include "../include/ahaac.h"
-#include "../include/ahflac.h"
-#include "../include/ahm4a.h"
+   its kind is told from its contents. Encoding mixes more than two channels
+   down to stereo and changes the sample rate when MP3 has no such rate, or
+   when --rate asks. */
+#include "../include/ahmix.h"
 #include "../include/ahmp3.h"
-#include "../include/ahwav.h"
+#include "../include/ahreader.h"
+#include "../include/ahresample.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@ typedef struct {
     size_t len, cap;
     int rate, channels;
     int bits;       /* of a lossless source, else 0 */
+    unsigned mask;  /* which speaker each channel is for, 0 = not said */
 } sound;
 
 static void sound_put(sound *s, const float *d, size_t n)
@@ -31,16 +33,6 @@ static void sound_put(sound *s, const float *d, size_t n)
     }
     memcpy(s->p + s->len, d, n * sizeof(float));
     s->len += n;
-}
-
-/* Keeps samples [first, first + count) per channel. */
-static void sound_trim(sound *s, size_t first, size_t count)
-{
-    size_t frames = s->channels ? s->len / (size_t)s->channels : 0;
-    if (first > frames) first = frames;
-    if (count > frames - first) count = frames - first;
-    memmove(s->p, s->p + first * (size_t)s->channels, count * (size_t)s->channels * sizeof(float));
-    s->len = count * (size_t)s->channels;
 }
 
 static unsigned char *read_file(const char *path, size_t *len)
@@ -60,109 +52,6 @@ static unsigned char *read_file(const char *path, size_t *len)
     return p;
 }
 
-/* ---- one loader per kind of file ------------------------------------------- */
-
-static const char *load_mpeg(const unsigned char *data, size_t len, bool trim, sound *s)
-{
-    ahmp3_decoder *d = ahmp3_decoder_new();
-    size_t pos = 0;
-    int layer = 0;
-    for (;;) {
-        float pcm[AHMP3_MAX_SAMPLES * 2];
-        int n;
-        ahmp3_frame fr;
-        size_t used = ahmp3_decode(d, data + pos, len - pos, true, pcm, &n, &fr);
-        if (!used) break;
-        pos += used;
-        if (!n) continue;
-        if (!s->rate) {
-            s->rate = fr.sample_rate;
-            s->channels = fr.channels;
-            layer = fr.layer;
-        }
-        if (fr.channels == s->channels) sound_put(s, pcm, (size_t)n * (size_t)fr.channels);
-    }
-    /* Gapless: drop the encoder's and the decoder's delay, and the padding. */
-    const ahmp3_info *info = ahmp3_decoder_info(d);
-    if (trim && layer == 3 && info->encoder_delay >= 0) {
-        size_t frames = s->len / (size_t)s->channels, skip = (size_t)info->encoder_delay + AHMP3_DECODER_DELAY;
-        size_t pad = info->encoder_padding > AHMP3_DECODER_DELAY ? (size_t)(info->encoder_padding - AHMP3_DECODER_DELAY) : 0;
-        sound_trim(s, skip, frames > skip + pad ? frames - skip - pad : 0);
-    }
-    ahmp3_decoder_free(d);
-    return s->rate ? NULL : "no MPEG audio frames found";
-}
-
-static const char *load_wav(const unsigned char *data, size_t len, sound *s)
-{
-    ahwav_decoder *d = ahwav_decoder_new();
-    static float pcm[8192];
-    size_t pos = 0;
-    for (;;) {
-        int n;
-        ahwav_format f;
-        size_t used = ahwav_decode(d, data + pos, len - pos, true, pcm, 8192, &n, &f);
-        pos += used;
-        if (n) {
-            s->rate = f.sample_rate;
-            s->channels = f.channels;
-            sound_put(s, pcm, (size_t)n * (size_t)f.channels);
-        }
-        if (!used && !n) break;
-    }
-    const char *error = ahwav_decoder_error(d);
-    ahwav_decoder_free(d);
-    return error ? error : s->rate ? NULL : "the WAV file holds no sound";
-}
-
-static const char *load_flac(const unsigned char *data, size_t len, sound *s)
-{
-    ahflac_decoder *d = ahflac_decoder_new();
-    static int32_t pcm[8192];
-    static float as_float[8192];
-    size_t pos = 0;
-    for (;;) {
-        int n;
-        ahflac_format f;
-        size_t used = ahflac_decode(d, data + pos, len - pos, true, pcm, 8192, &n, &f);
-        pos += used;
-        if (n) {
-            s->rate = f.sample_rate;
-            s->channels = f.channels;
-            s->bits = f.bits;
-            ahflac_to_float(pcm, as_float, (size_t)n * (size_t)f.channels, f.bits);
-            sound_put(s, as_float, (size_t)n * (size_t)f.channels);
-        }
-        if (!used && !n) break;
-    }
-    const char *error = ahflac_decoder_error(d);
-    ahflac_decoder_free(d);
-    return error ? error : s->rate ? NULL : "the FLAC file holds no sound";
-}
-
-static const char *load_adts(const unsigned char *data, size_t len, sound *s)
-{
-    ahaac_decoder *d = ahaac_decoder_new();
-    size_t pos = 0;
-    for (;;) {
-        float pcm[AHAAC_MAX_SAMPLES * AHAAC_MAX_CHANNELS];
-        int n;
-        ahaac_frame fr;
-        size_t used = ahaac_decode(d, data + pos, len - pos, true, pcm, &n, &fr);
-        if (!used) break;
-        pos += used;
-        if (!n) continue;
-        if (!s->rate) {
-            s->rate = fr.sample_rate;
-            s->channels = fr.channels;
-        }
-        if (fr.channels == s->channels) sound_put(s, pcm, (size_t)n * (size_t)fr.channels);
-    }
-    const char *error = ahaac_decoder_error(d);
-    ahaac_decoder_free(d);
-    return s->rate ? NULL : error ? error : "no AAC frames found";
-}
-
 typedef struct {
     const unsigned char *p;
     size_t len;
@@ -177,62 +66,77 @@ static size_t memory_read(void *user, uint64_t offset, void *buffer, size_t byte
     return bytes;
 }
 
-static const char *load_m4a(const unsigned char *data, size_t len, bool trim, sound *s)
-{
-    memory_file file = {data, len};
-    const char *error = NULL;
-    ahm4a *m = ahm4a_open(memory_read, &file, len, &error);
-    if (!m) return error;
-    const ahm4a_info *info = ahm4a_get_info(m);
-    ahaac_decoder *d = ahaac_decoder_new();
-    if (!ahaac_decoder_configure(d, info->config, info->config_bytes)) error = ahaac_decoder_error(d);
-    unsigned char *packet = malloc((size_t)info->max_packet_bytes + 1);
-    for (uint64_t i = 0; !error && i < info->packets; i++) {
-        float pcm[AHAAC_MAX_SAMPLES * AHAAC_MAX_CHANNELS];
-        int n;
-        ahaac_frame fr;
-        size_t bytes = ahm4a_read_packet(m, i, packet, (size_t)info->max_packet_bytes);
-        if (!bytes || !ahaac_decode_packet(d, packet, bytes, pcm, &n, &fr) || !n) continue;
-        if (!s->rate) {
-            s->rate = fr.sample_rate;
-            s->channels = fr.channels;
-        }
-        if (fr.channels == s->channels) sound_put(s, pcm, (size_t)n * (size_t)fr.channels);
-    }
-    if (!error && !s->rate) error = ahaac_decoder_error(d) ? ahaac_decoder_error(d) : "the M4A file holds no sound that could be decoded";
-    if (!error && trim) sound_trim(s, info->delay, (size_t)info->samples);
-    free(packet);
-    ahaac_decoder_free(d);
-    ahm4a_close(m);
-    return error;
-}
-
 /* Reads a sound file of any kind handled. Returns NULL, or what went wrong. */
-static const char *load(const char *path, bool trim, sound *s)
+static const char *load(const char *path, sound *s)
 {
     size_t len;
     unsigned char *data = read_file(path, &len);
     memset(s, 0, sizeof(*s));
     if (!data) return "cannot read the file";
-    /* Past a tag at the front, the first bytes tell the kinds apart. */
-    size_t at = ahmp3_id3v2_size(data, len);
-    if (at > len) at = 0;
-    const unsigned char *p = data + at;
-    size_t left = len - at;
-    const char *error;
-    if (left >= 12 && (!memcmp(p, "RIFF", 4) || !memcmp(p, "RF64", 4))) error = load_wav(p, left, s);
-    else if (left >= 4 && !memcmp(p, "fLaC", 4)) error = load_flac(p, left, s);
-    else if (left >= 12 && !memcmp(p + 4, "ftyp", 4)) error = load_m4a(p, left, trim, s);
-    else {
-        /* MPEG audio and ADTS both start with eleven 1 bits; ADTS has two
-           0 bits where MPEG audio names its layer. */
-        size_t i = 0;
-        while (i + 2 <= left && !(p[i] == 0xFF && (p[i + 1] & 0xE0) == 0xE0)) i++;
-        if (i + 2 <= left && (p[i + 1] & 0xF6) == 0xF0) error = load_adts(p, left, s);
-        else error = load_mpeg(data, len, trim, s);
+    memory_file file = {data, len};
+    const char *error = NULL;
+    ahreader *r = ahreader_open(memory_read, &file, len, &error);
+    if (r) {
+        const ahreader_info *info = ahreader_get_info(r);
+        s->rate = info->sample_rate;
+        s->channels = info->channels;
+        s->bits = info->bits;
+        s->mask = info->channel_mask;
+        if (info->half_rate) fprintf(stderr, "%s: an HE-AAC file, played as the plain AAC inside it (half the sample rate)\n", path);
+        static float pcm[8 * 4096];
+        size_t n;
+        while ((n = ahreader_read(r, pcm, 4096)) != 0) sound_put(s, pcm, n * (size_t)s->channels);
+        ahreader_close(r);
+        if (!s->len) error = "the file holds no sound";
     }
     free(data);
     return error;
+}
+
+/* Mixes more than two channels down to stereo. */
+static void to_stereo(sound *s)
+{
+    ahmix m;
+    if (s->channels <= 2 || !ahmix_init(&m, s->channels, s->mask)) return;
+    size_t frames = s->len / (size_t)s->channels;
+    ahmix_to_stereo(&m, s->p, frames, s->p);
+    s->len = frames * 2;
+    s->channels = 2;
+    s->mask = 0;
+}
+
+/* Changes the sample rate. */
+static bool to_rate(sound *s, int rate)
+{
+    if (rate == s->rate) return true;
+    ahresample *r = ahresample_new(s->rate, rate, s->channels);
+    if (!r) return false;
+    sound out = *s;
+    out.p = NULL;
+    out.len = out.cap = 0;
+    out.rate = rate;
+    static float buf[8 * 4096];
+    size_t frames = s->len / (size_t)s->channels, pos = 0, used, made;
+    while (pos < frames) {
+        made = ahresample_process(r, s->p + pos * (size_t)s->channels, frames - pos, &used, buf, 4096);
+        sound_put(&out, buf, made * (size_t)s->channels);
+        pos += used;
+    }
+    while ((made = ahresample_flush(r, buf, 4096)) != 0) sound_put(&out, buf, made * (size_t)s->channels);
+    ahresample_free(r);
+    free(s->p);
+    *s = out;
+    return true;
+}
+
+/* The MP3 rate to use for sound at `rate`: itself when MP3 has it, else the
+   next one up, else the highest. */
+static int mp3_rate_for(int rate)
+{
+    static const int rates[] = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000};
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++)
+        if (rates[i] >= rate) return rates[i];
+    return 48000;
 }
 
 /* ---- commands ---------------------------------------------------------------- */
@@ -240,10 +144,10 @@ static const char *load(const char *path, bool trim, sound *s)
 static void put32(FILE *f, unsigned v) { fputc(v & 255, f); fputc((v >> 8) & 255, f); fputc((v >> 16) & 255, f); fputc(v >> 24, f); }
 static void put16(FILE *f, unsigned v) { fputc(v & 255, f); fputc((v >> 8) & 255, f); }
 
-static int decode(const char *in, const char *out, bool raw_float, bool trim)
+static int decode(const char *in, const char *out, bool raw_float)
 {
     sound s;
-    const char *error = load(in, trim, &s);
+    const char *error = load(in, &s);
     if (error) {
         fprintf(stderr, "%s: %s\n", in, error);
         return 1;
@@ -295,16 +199,18 @@ static int decode(const char *in, const char *out, bool raw_float, bool trim)
     return 0;
 }
 
-static int encode(const char *in, const char *out, int kbps, ahmp3_mode mode, int vbr)
+static int encode(const char *in, const char *out, int kbps, ahmp3_mode mode, int vbr, int rate)
 {
     sound s;
-    const char *error = load(in, true, &s);
+    const char *error = load(in, &s);
     if (error) {
         fprintf(stderr, "%s: %s\n", in, error);
         return 1;
     }
-    if (s.channels > 2) {
-        fprintf(stderr, "%s: more than two channels\n", in);
+    to_stereo(&s);
+    if (!rate) rate = mp3_rate_for(s.rate);
+    if (!to_rate(&s, rate)) {
+        fprintf(stderr, "cannot convert %d Hz to %d Hz\n", s.rate, rate);
         return 1;
     }
     ahmp3_encoder_config cfg = {s.rate, s.channels, kbps, mode, vbr};
@@ -339,15 +245,13 @@ static int encode(const char *in, const char *out, int kbps, ahmp3_mode mode, in
 int main(int argc, char **argv)
 {
     if (argc >= 4 && !strcmp(argv[1], "decode")) {
-        bool raw = false, trim = true;
-        for (int i = 4; i < argc; i++) {
+        bool raw = false;
+        for (int i = 4; i < argc; i++)
             if (!strcmp(argv[i], "--raw-float")) raw = true;
-            if (!strcmp(argv[i], "--no-trim")) trim = false;
-        }
-        return decode(argv[2], argv[3], raw, trim);
+        return decode(argv[2], argv[3], raw);
     }
     if (argc >= 4 && !strcmp(argv[1], "encode")) {
-        int kbps = 128, vbr = 0;
+        int kbps = 128, vbr = 0, rate = 0;
         bool kbps_given = false;
         ahmp3_mode mode = AHMP3_JOINT_STEREO;
         for (int i = 4; i < argc; i++) {
@@ -356,13 +260,14 @@ int main(int argc, char **argv)
                 kbps_given = true;
             }
             if (!strcmp(argv[i], "--vbr") && i + 1 < argc) vbr = atoi(argv[++i]);
+            if (!strcmp(argv[i], "--rate") && i + 1 < argc) rate = atoi(argv[++i]);
             if (!strcmp(argv[i], "--stereo")) mode = AHMP3_STEREO;
             if (!strcmp(argv[i], "--mono")) mode = AHMP3_MONO;
         }
-        return encode(argv[2], argv[3], vbr && !kbps_given ? 0 : kbps, mode, vbr);
+        return encode(argv[2], argv[3], vbr && !kbps_given ? 0 : kbps, mode, vbr, rate);
     }
-    fprintf(stderr, "usage: ahmp3 decode <in> <out.wav> [--raw-float] [--no-trim]\n"
-                    "       ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono]\n"
+    fprintf(stderr, "usage: ahmp3 decode <in> <out.wav> [--raw-float]\n"
+                    "       ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono] [--rate 44100]\n"
                     "<in> is an MP3, WAV, FLAC, AAC or M4A file.\n");
     return 2;
 }

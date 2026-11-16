@@ -130,6 +130,16 @@ static const char *read_description(span stsd, ahm4a *m)
     uint32_t version = be16(entry.p + 8);
     size_t fixed = version == 1 ? 28 + 16 : version == 2 ? 28 + 36 : 28;
     if (entry.len < fixed) return "damaged MP4 sound description";
+    if (version == 2) {
+        /* The short fields are placeholders: the rate is a 64-bit float
+           and the channel count a 32-bit number further on. */
+        uint64_t bits = be64(entry.p + 32);
+        double rate;
+        memcpy(&rate, &bits, sizeof(rate));
+        uint32_t channels = be32(entry.p + 40);
+        m->info.sample_rate = rate >= 1 && rate <= 1e6 ? (int)(rate + 0.5) : 0;
+        m->info.channels = channels <= 64 ? (int)channels : 0;
+    }
     span inside = {entry.p + fixed, entry.len - fixed};
     if (find_box(inside, "esds", &esds)) return read_esds(esds, m);
     if (find_box(inside, "wave", &wave) && find_box(wave, "esds", &esds)) return read_esds(esds, m);
@@ -155,7 +165,7 @@ static const char *read_tables(span stbl, ahm4a *m, uint64_t *duration)
     if ((stco.len - 8) / (wide ? 8 : 4) < chunks || (stsc.len - 8) / 12 < runs) return "damaged MP4 index";
     if (!count || !chunks || !runs) return "the MP4 file holds no sound";
     /* With one size for all, the count is not tied to the box's length. */
-    if (fixed_size && count > m->size) return "damaged MP4 index";
+    if (fixed_size && count > m->size / fixed_size) return "damaged MP4 index";
 
     m->offsets = malloc((size_t)count * sizeof(uint64_t));
     m->sizes = malloc((size_t)count * sizeof(uint32_t));
@@ -256,6 +266,7 @@ static const char *read_index(span moov, ahm4a *m)
 
         uint32_t media_scale = 0;
         if (find_box(mdia, "mdhd", &mdhd) && mdhd.len >= 24) media_scale = be32(mdhd.p + (mdhd.p[0] == 1 ? 20 : 12));
+        m->info.timescale = media_scale ? media_scale : m->info.sample_rate > 0 ? (uint32_t)m->info.sample_rate : 0;
         /* The edit list: the first entry that plays something says where
            in the track the music starts and how long it runs. */
         if (find_box(trak, "edts", &edts) && find_box(edts, "elst", &elst) && elst.len >= 8 && media_scale) {

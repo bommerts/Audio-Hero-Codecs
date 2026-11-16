@@ -18,6 +18,10 @@ struct ahwav_decoder {
     uint64_t skip_pending; /* bytes of a chunk still to pass over */
     uint64_t data_left;    /* bytes of sound left in the data chunk */
     bool data_open;        /* the data chunk runs to the end of the file */
+    uint64_t consumed;     /* bytes used by earlier calls */
+    uint64_t data_start;   /* where the sound starts, from the first byte fed */
+    uint64_t data_size;    /* bytes of sound in all (not when data_open) */
+    bool in_data;          /* the data chunk has been reached */
 };
 
 static uint32_t le16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
@@ -54,6 +58,7 @@ static bool read_format(ahwav_decoder *d, const uint8_t *p, size_t size)
     if (tag == 0xFFFE) {
         if (size < 40) return false;
         tag = le16(p + 24);
+        d->format.channel_mask = le32(p + 20);
     }
     if (tag != 1 && tag != 3) return false;
     if (channels < 1 || channels > AHWAV_MAX_CHANNELS || rate < 1 || rate > 768000) return false;
@@ -179,6 +184,9 @@ size_t ahwav_decode(ahwav_decoder *d, const uint8_t *data, size_t len, bool eof,
                 d->data_left = size;
                 size_t block = (size_t)d->sample_bytes * (size_t)d->format.channels;
                 d->format.samples = d->data_open ? 0 : size / block;
+                d->data_start = d->consumed + pos;
+                d->data_size = size;
+                d->in_data = true;
                 d->state = ST_DATA;
             } else {
                 pos += 8;
@@ -220,5 +228,21 @@ size_t ahwav_decode(ahwav_decoder *d, const uint8_t *data, size_t len, bool eof,
         if (d->have_format) *format = d->format;
         else memset(format, 0, sizeof(*format));
     }
+    d->consumed += pos;
     return pos;
+}
+
+bool ahwav_decoder_seek(ahwav_decoder *d, uint64_t sample, uint64_t *offset)
+{
+    if (!d->in_data || d->state == ST_ERROR) return false;
+    uint64_t block = (uint64_t)d->sample_bytes * (uint64_t)d->format.channels;
+    if (sample > UINT64_MAX / block) return false;
+    uint64_t at = sample * block;
+    if (!d->data_open && at > d->data_size) return false;
+    d->data_left = d->data_open ? 0 : d->data_size - at;
+    d->skip_pending = 0;
+    d->state = ST_DATA;
+    d->consumed = d->data_start + at;
+    *offset = d->data_start + at;
+    return true;
 }

@@ -31,7 +31,10 @@ add_library(ahcodecs STATIC
   src/ahflac.c
   src/ahaac_tables.c
   src/ahaac_decode.c
-  src/ahm4a.c)
+  src/ahm4a.c
+  src/ahreader.c
+  src/ahresample.c
+  src/ahmix.c)
 target_include_directories(ahcodecs PUBLIC include)
 if(NOT MSVC)
   target_link_libraries(ahcodecs PUBLIC m)
@@ -46,5 +49,7 @@ add_executable(ahmp3_tests
   tests/test_layers.c
   tests/test_wav.c
   tests/test_flac.c
-  tests/test_aac.c)
+  tests/test_aac.c
+  tests/test_convert.c
+  tests/test_reader.c)
 target_link_libraries(ahmp3_tests ahcodecs)

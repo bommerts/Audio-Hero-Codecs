@@ -48,6 +48,12 @@ void ahflac_decoder_reset(ahflac_decoder *d);
 size_t ahflac_decode(ahflac_decoder *d, const uint8_t *data, size_t len, bool eof, int32_t *pcm, size_t pcm_cap,
                      int *samples, ahflac_format *format);
 
+/* Where the sound given out so far ends: the place, in samples per channel
+   from the start of the file, of the next sample ahflac_decode will give.
+   It goes by the number each frame carries, so it is right after a seek
+   too. 0 before the first frame. */
+uint64_t ahflac_decoder_position(const ahflac_decoder *d);
+
 /* NULL while all is well; otherwise why the file cannot be read. */
 const char *ahflac_decoder_error(const ahflac_decoder *d);
 

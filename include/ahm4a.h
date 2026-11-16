@@ -31,9 +31,13 @@ typedef struct {
     /* For gapless playback: the decoded sound starts with `delay` samples
        that are not part of the music (the encoder's run-in), and `samples`
        are to be played after them (0 when the file does not say). Taken
-       from the file's edit list, or else from an iTunes gapless tag. */
+       from the file's edit list, or else from an iTunes gapless tag. Both
+       count in the track's own time units, `timescale` to the second:
+       normally its sample rate, but not always (an HE-AAC track decodes
+       at half the rate it counts in). */
     uint32_t delay;
     uint64_t samples;
+    uint32_t timescale;
 } ahm4a_info;
 
 typedef struct ahm4a ahm4a;

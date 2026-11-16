@@ -18,6 +18,8 @@ struct ahflac_decoder {
     int64_t *chan[AHFLAC_MAX_CHANNELS]; /* the frame in hand, one run per channel */
     int chan_cap;
     int block_len, block_pos;           /* its samples, and how many were given out */
+    uint64_t block_start;               /* where its first sample lies in the file */
+    int fixed_block;                    /* samples per frame of a stream whose frames are all one size */
 
     uint8_t crc8[256];
     uint16_t crc16[256];
@@ -123,8 +125,14 @@ void ahflac_decoder_free(ahflac_decoder *d)
     free(d);
 }
 
+uint64_t ahflac_decoder_position(const ahflac_decoder *d)
+{
+    return d->block_start + (uint64_t)d->block_pos;
+}
+
 void ahflac_decoder_reset(ahflac_decoder *d)
 {
+    d->block_start += (uint64_t)d->block_len;
     d->block_len = d->block_pos = 0;
     if (d->state == ST_FRAMES) d->skip_pending = 0;
 }
@@ -256,16 +264,20 @@ static int decode_frame(ahflac_decoder *d, const uint8_t *p, size_t len, size_t 
     int block_code = p[2] >> 4, rate_code = p[2] & 15, assign = p[3] >> 4, width_code = (p[3] >> 1) & 7;
     if ((p[1] & 2) || (p[3] & 1) || block_code == 0 || rate_code == 15 || assign > 10 || width_code == 3) return -1;
 
-    /* The frame or sample number, coded like UTF-8: its size is all that is
-       needed here. */
+    /* The frame or sample number, coded like UTF-8. */
     size_t n = 5;
     uint8_t lead = p[4];
+    uint64_t number = lead;
     if (lead >= 0x80) {
         if (lead < 0xC0 || lead == 0xFF) return -1;
-        for (uint8_t m = 0x40; lead & m; m >>= 1) n++;
+        uint8_t m = 0x40;
+        for (; lead & m; m >>= 1) n++;
         if (len < n) return 0;
-        for (size_t i = 5; i < n; i++)
+        number = lead & (m - 1u);
+        for (size_t i = 5; i < n; i++) {
             if ((p[i] & 0xC0) != 0x80) return -1;
+            number = number << 6 | (p[i] & 0x3Fu);
+        }
     }
     size_t tail = (block_code == 6 ? 1u : block_code == 7 ? 2u : 0u) + (rate_code == 12 ? 1u : rate_code > 12 ? 2u : 0u);
     if (len < n + tail + 1) return 0;
@@ -331,6 +343,9 @@ static int decode_frame(ahflac_decoder *d, const uint8_t *p, size_t len, size_t 
     }
     d->block_len = block;
     d->block_pos = 0;
+    /* A stream of frames of one size numbers its frames; one of mixed sizes
+       says where each frame's first sample lies. */
+    d->block_start = (p[1] & 1) ? number : number * (uint64_t)(d->fixed_block ? d->fixed_block : block);
     *frame_bytes = end + 2;
     return 1;
 }
@@ -359,6 +374,7 @@ static bool read_stream_info(ahflac_decoder *d, const uint8_t *p)
 {
     ahflac_format *f = &d->format;
     int max_block = p[2] << 8 | p[3];
+    d->fixed_block = (p[0] << 8 | p[1]) == max_block && max_block >= 16 ? max_block : 0;
     f->sample_rate = p[10] << 12 | p[11] << 4 | p[12] >> 4;
     f->channels = ((p[12] >> 1) & 7) + 1;
     f->bits = ((p[12] & 1) << 4 | p[13] >> 4) + 1;

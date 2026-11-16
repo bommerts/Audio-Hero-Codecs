@@ -1173,6 +1173,14 @@ int main(int argc, char **argv)
                       " 2>&1") == 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--no-ffmpeg")) g_ffmpeg = false;
+        if (!strcmp(argv[i], "--only") && i + 1 < argc) {
+            /* One part alone, while working on it. */
+            setvbuf(stdout, NULL, _IONBF, 0);
+            if (!strcmp(argv[i + 1], "convert")) test_convert();
+            if (!strcmp(argv[i + 1], "reader")) test_reader();
+            printf("%d checks, %d failed\n", g_checks, g_failures);
+            return g_failures ? 1 : 0;
+        }
         if (!strcmp(argv[i], "--type") && i + 1 < argc) g_force_type = atoi(argv[++i]);
         if (!strcmp(argv[i], "--features") && i + 1 < argc) {
             g_features = atoi(argv[++i]);
@@ -1234,6 +1242,9 @@ int main(int argc, char **argv)
     test_flac();
     printf("AAC\n");
     test_aac();
+    test_convert();
+    printf("one reader for every kind of file\n");
+    test_reader();
     printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
