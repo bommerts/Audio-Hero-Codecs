@@ -1,4 +1,4 @@
-# Audio Hero MP3
+# Audio Hero Codecs
 
 Audio decoders and an MP3 encoder in plain C, written from the published
 standards with no dependencies beyond the C standard library. They were built
@@ -13,7 +13,8 @@ and are published here for anyone to use.
 | AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
 | WAV | yes | | `ahwav.h` |
 
-The repository keeps the name it started with, when it held MP3 alone.
+The repository was first named Audio-Hero-MP3, when it held MP3 alone. Links
+to the old name still work.
 
 ## What it does
 
