@@ -1,10 +1,12 @@
-/* Layer III decoder, following ISO/IEC 11172-3 (MPEG-1) and 13818-3
-   (MPEG-2 low sample rates), with the MPEG-2.5 extension. Where the standard
-   leaves room, it behaves like the decoders in common use, so files that
-   play elsewhere play here the same. */
+/* MPEG audio decoder, following ISO/IEC 11172-3 (MPEG-1) and 13818-3
+   (MPEG-2 low sample rates), with the MPEG-2.5 extension. Layer III is here;
+   Layers I and II share this file's framing and filter bank. Where the
+   standard leaves room, it behaves like the decoders in common use, so files
+   that play elsewhere play here the same. */
 #include "ahmp3_internal.h"
 
-#define RESERVOIR 2048 /* more than any main_data_begin (511) plus one frame */
+#define MAX_FREE_FRAME 4096 /* the largest free-format frame looked for */
+#define RESERVOIR 5120      /* more than any main_data_begin (511) plus one frame */
 
 typedef struct {
     int part23, big_values, global_gain, scalefac_compress;
@@ -40,7 +42,10 @@ struct ahmp3_decoder {
     float overlap[2][32][18];
     float V[2][1024];
 
+    float sub12[2][36][32]; /* subband samples of a Layer I or II frame */
+
     ahmp3_header last;
+    int free_base;          /* frame size of a free-format stream, less padding */
     bool synced;
     bool started; /* the first frame has been looked at for an Info header */
     size_t skip_pending;
@@ -122,6 +127,7 @@ void ahmp3_decoder_reset(ahmp3_decoder *d)
     memset(d->overlap, 0, sizeof(d->overlap));
     memset(d->V, 0, sizeof(d->V));
     d->synced = false;
+    d->free_base = 0;
     d->skip_pending = 0;
 }
 
@@ -477,10 +483,10 @@ static void imdct(ahmp3_decoder *d, int ch, const granule *G, const float xr[576
     }
 }
 
-static void synthesize(ahmp3_decoder *d, int ch, const float in[18][32], float *pcm, int stride)
+static void synthesize(ahmp3_decoder *d, int ch, const float (*in)[32], int slots, float *pcm, int stride)
 {
     float *V = d->V[ch];
-    for (int t = 0; t < 18; t++) {
+    for (int t = 0; t < slots; t++) {
         memmove(V + 64, V, (1024 - 64) * sizeof(float));
         const float *S = in[t];
         for (int i = 0; i < 64; i++) {
@@ -549,16 +555,72 @@ static bool read_info_frame(const unsigned char *f, const ahmp3_header *h, ahmp3
 
 static bool same_stream(const ahmp3_header *a, const ahmp3_header *b)
 {
-    return a->lsf == b->lsf && a->mpeg25 == b->mpeg25 && a->sr_index == b->sr_index;
+    return a->lsf == b->lsf && a->mpeg25 == b->mpeg25 && a->sr_index == b->sr_index && a->layer == b->layer &&
+           a->free_format == b->free_format;
 }
 
-static void decode_frame(ahmp3_decoder *d, const unsigned char *f, const ahmp3_header *h, float *pcm)
+/* Finds the size of the free-format frame at p, whose header does not give
+   it: the same for every frame of the stream, so it is the distance to the
+   next header like this one, confirmed by the header after that. Returns 1
+   with h filled in, 0 when more data is needed, -1 when this is no frame. */
+static int free_frame(const ahmp3_decoder *d, const unsigned char *p, size_t len, bool eof, bool trusted, ahmp3_header *h,
+                      int *base_out)
+{
+    int unit = h->layer == 1 ? 4 : 1; /* Layer I frames come in 4-byte slots */
+    int pad = h->padding * unit, base = 0;
+    int least = 4 + 2 * h->crc + h->side_bytes + 1;
+    if (trusted && d->free_base) {
+        base = d->free_base;
+    } else {
+        for (int n = (least + unit - 1) / unit * unit;; n += unit) {
+            if (n > MAX_FREE_FRAME) return -1;
+            if ((size_t)n + 4 > len) return eof ? -1 : 0;
+            ahmp3_header next, third;
+            if (p[n] != 0xFF || !ahmp3_read_header(p + n, &next) || !same_stream(h, &next) || next.channels != h->channels) continue;
+            if (n - pad < least) continue;
+            size_t after = (size_t)n + (size_t)(n - pad + next.padding * unit);
+            if (after + 4 > len) {
+                if (!eof) return 0;
+            } else if (!ahmp3_read_header(p + after, &third) || !same_stream(h, &third)) {
+                continue;
+            }
+            base = n - pad;
+            break;
+        }
+    }
+    h->frame_bytes = base + pad;
+    long long rate = ahmp3_sample_rates[h->sr_index];
+    h->kbps = (int)((base * 8 * rate + h->samples * 500LL) / (h->samples * 1000LL));
+    *base_out = base;
+    return 1;
+}
+
+/* Layers I and II: false when the frame's CRC does not match. */
+static bool decode_frame12(ahmp3_decoder *d, const unsigned char *f, const ahmp3_header *h, float *pcm)
+{
+    bool ok = ahmp3_layer12_decode(h, f, d->sub12);
+    for (int ch = 0; ch < h->channels; ch++)
+        synthesize(d, ch, (const float (*)[32])d->sub12[ch], h->layer == 1 ? 12 : 36, pcm + ch, h->channels);
+    return ok;
+}
+
+/* Layer III: false when the frame's CRC does not match. */
+static bool decode_frame(ahmp3_decoder *d, const unsigned char *f, const ahmp3_header *h, float *pcm)
 {
     ahmp3_bits b = {f + 4 + 2 * h->crc, (size_t)h->side_bytes * 8, 0};
     int main_data_begin;
     granule gr[2][2];
     int nch = h->channels, ngr = h->lsf ? 1 : 2;
-    bool ok = read_side_info(&b, h, &main_data_begin, gr);
+    /* The CRC covers the last two header bytes and the side information. A
+       frame that fails it is played as silence: wrong side information can
+       turn into a loud burst. Its main data still joins the reservoir. */
+    bool crc_ok = true;
+    if (h->crc) {
+        unsigned crc = ahmp3_crc16(0xFFFF, f + 2, 16);
+        crc = ahmp3_crc16(crc, f + 6, (size_t)h->side_bytes * 8);
+        crc_ok = crc == ((unsigned)f[4] << 8 | f[5]);
+    }
+    bool ok = read_side_info(&b, h, &main_data_begin, gr) && crc_ok;
 
     /* Main data: this frame's bytes join the reservoir; ours start
        main_data_begin bytes before them. */
@@ -605,9 +667,10 @@ static void decode_frame(ahmp3_decoder *d, const unsigned char *f, const ahmp3_h
             reorder(h, &gr[g][ch], xr[ch]);
             alias_reduce(d, &gr[g][ch], xr[ch]);
             imdct(d, ch, &gr[g][ch], xr[ch], sub);
-            synthesize(d, ch, sub, pcm + g * 576 * nch + ch, nch);
+            synthesize(d, ch, (const float (*)[32])sub, 18, pcm + g * 576 * nch + ch, nch);
         }
     }
+    return crc_ok;
 }
 
 size_t ahmp3_decode(ahmp3_decoder *d, const uint8_t *data, size_t len, bool eof,
@@ -622,6 +685,7 @@ size_t ahmp3_decode(ahmp3_decoder *d, const uint8_t *data, size_t len, bool eof,
 
     size_t pos = 0;
     ahmp3_header h;
+    int free_base = 0;
     for (;; pos++) {
         if (pos + 4 > len) {
             /* No frame here. Keep the last bytes: a header may start there. */
@@ -639,12 +703,17 @@ size_t ahmp3_decode(ahmp3_decoder *d, const uint8_t *data, size_t len, bool eof,
         }
         if (data[pos] != 0xFF || !ahmp3_read_header(data + pos, &h)) continue;
         bool trusted = d->synced && same_stream(&h, &d->last);
+        if (h.free_format) {
+            int found = free_frame(d, data + pos, len - pos, eof, trusted, &h, &free_base);
+            if (found == 0) return pos; /* wait for the frames that follow */
+            if (found < 0) continue;
+        }
         if (pos + (size_t)h.frame_bytes > len) {
             if (!eof) return pos; /* wait for the whole frame */
             if (!trusted) continue;
             return len;           /* a cut-off last frame */
         }
-        if (!trusted) {
+        if (!trusted && !h.free_format) {
             /* A false sync is unlikely to be followed by a matching header. */
             size_t next = pos + (size_t)h.frame_bytes;
             if (next + 4 <= len) {
@@ -661,17 +730,19 @@ size_t ahmp3_decode(ahmp3_decoder *d, const uint8_t *data, size_t len, bool eof,
     if (d->synced && !same_stream(&h, &d->last)) ahmp3_decoder_reset(d);
     d->synced = true;
     d->last = h;
-    if (frame) ahmp3_parse_header(f, (size_t)h.frame_bytes, frame);
+    d->free_base = free_base;
+    if (frame) ahmp3_fill_frame(&h, frame);
 
     if (!d->started) {
         d->started = true;
         ahmp3_info info;
-        if (read_info_frame(f, &h, &info)) {
+        if (h.layer == 3 && read_info_frame(f, &h, &info)) {
             d->info = info;
             return pos + (size_t)h.frame_bytes;
         }
     }
-    decode_frame(d, f, &h, pcm);
-    *samples = h.lsf ? 576 : 1152;
+    bool crc_ok = h.layer == 3 ? decode_frame(d, f, &h, pcm) : decode_frame12(d, f, &h, pcm);
+    if (frame) frame->crc_error = !crc_ok;
+    *samples = h.samples;
     return pos + (size_t)h.frame_bytes;
 }

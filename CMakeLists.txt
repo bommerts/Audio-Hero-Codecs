@@ -18,20 +18,33 @@ else()
   add_compile_options(-Wall -Wextra -Werror -O2)
 endif()
 
-add_library(ahmp3 STATIC
+# The library is not named ahmp3: the command line tool is, and on Windows
+# the two would both claim ahmp3.lib and ahmp3.pdb.
+add_library(ahcodecs STATIC
   src/ahmp3_tables.c
   src/ahmp3_huff.c
   src/ahmp3_decode.c
+  src/ahmp3_layer12.c
   src/ahmp3_bitstream.c
-  src/ahmp3_encode.c)
-target_include_directories(ahmp3 PUBLIC include)
+  src/ahmp3_encode.c
+  src/ahwav.c
+  src/ahflac.c
+  src/ahaac_tables.c
+  src/ahaac_decode.c
+  src/ahm4a.c)
+target_include_directories(ahcodecs PUBLIC include)
 if(NOT MSVC)
-  target_link_libraries(ahmp3 PUBLIC m)
+  target_link_libraries(ahcodecs PUBLIC m)
 endif()
 
 add_executable(ahmp3_tool tools/ahmp3.c)
 set_target_properties(ahmp3_tool PROPERTIES OUTPUT_NAME ahmp3)
-target_link_libraries(ahmp3_tool ahmp3)
+target_link_libraries(ahmp3_tool ahcodecs)
 
-add_executable(ahmp3_tests tests/tests.c)
-target_link_libraries(ahmp3_tests ahmp3)
+add_executable(ahmp3_tests
+  tests/tests.c
+  tests/test_layers.c
+  tests/test_wav.c
+  tests/test_flac.c
+  tests/test_aac.c)
+target_link_libraries(ahmp3_tests ahcodecs)

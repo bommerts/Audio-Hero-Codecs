@@ -24,6 +24,9 @@ struct ahmp3_encoder {
     ahmp3_tables t;
     int lsf, sr_index, bitrate_index, channels_in, channels, mode;
     int granules;           /* per frame: 2 (MPEG-1) or 1 */
+    int vbr;                /* 0 = constant bit rate, else the quality 1..10;
+                               bitrate_index is then the highest allowed */
+    double vbr_noise;       /* how far noise may go over the masking threshold */
     int max_reservoir;      /* bytes main_data_begin can reach back */
     int frame_base, frame_rest, frame_acc; /* frame size bookkeeping */
     float cutoff;           /* lowpass, as a fraction of the band */
@@ -43,7 +46,8 @@ struct ahmp3_encoder {
     float ath_long[22], ath_short[13];
     float bark_long[22], bark_short[13];
     float spread_long[22][22], spread_short[13][13];
-    float prev_xmin[2][22];
+    float prev_xmin[4][22]; /* left, right, and (variable bit rate) mid, side */
+    bool prev_ms;
     float pe_average;
     double full_scale;
 
@@ -55,7 +59,24 @@ struct ahmp3_encoder {
     int slots_pending;      /* main data capacity of the queued frames */
     long long samples_in;
     int flushed;
+
+    /* totals for the info frame */
+    uint32_t frames_out;
+    uint64_t bytes_out;
+    uint16_t music_crc;     /* CRC of every frame written */
+    uint64_t seek[256];     /* byte offset of every seek_stride-th frame */
+    int seek_count, seek_stride;
 };
+
+/* CRC-16 with the reflected polynomial 0xA001, as the LAME tag uses. */
+static uint16_t crc_a001(uint16_t crc, const unsigned char *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) crc = (uint16_t)(crc & 1 ? (crc >> 1) ^ 0xA001 : crc >> 1);
+    }
+    return crc;
+}
 
 /* ---- setup ----------------------------------------------------------------- */
 
@@ -126,11 +147,12 @@ ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
     int sr = find_index(ahmp3_sample_rates, 9, c->sample_rate);
     if (sr < 0) return NULL;
     int lsf = sr >= 3;
-    int br = find_index(ahmp3_bitrates[lsf], 15, c->bitrate_kbps);
+    if (c->vbr_quality < 0 || c->vbr_quality > 10) return NULL;
+    /* With variable bit rate the bit rate is the most a frame may use, and 0
+       means the format's highest. */
+    int br = c->vbr_quality && !c->bitrate_kbps ? 14 : find_index(ahmp3_bitrates[lsf], 15, c->bitrate_kbps);
     if (br <= 0) return NULL;
     int channels = c->mode == AHMP3_MONO || c->channels == 1 ? 1 : 2;
-    /* MPEG-1 allows only some bit rates with two channels or one. */
-    if (!lsf && channels == 2 && c->bitrate_kbps < 32) return NULL;
 
     ahmp3_encoder *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
@@ -147,6 +169,7 @@ ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
     e->frame_base = num / c->sample_rate;
     e->frame_rest = num % c->sample_rate;
     e->prev_block = 0;
+    e->seek_stride = 1;
 
     for (int k = 0; k < 32; k++)
         for (int i = 0; i < 64; i++) e->analysis[k][i] = (float)cos((2 * k + 1) * (i - 16) * AHMP3_PI / 64);
@@ -171,6 +194,15 @@ ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
     else if (per_channel >= 24) hz = 8000;
     else if (per_channel >= 16) hz = 5500;
     else hz = 3500;
+    if (c->vbr_quality) {
+        /* The quality sets the treble kept and how far under the masking
+           threshold the noise must stay: 3 dB more for each step up. The
+           model is a simple one, so the top settings keep a wide margin. */
+        static const int treble[11] = {0, 11000, 12500, 14000, 15000, 16000, 17000, 18000, 19000, 19500, 20500};
+        hz = treble[c->vbr_quality];
+        e->vbr = c->vbr_quality;
+        e->vbr_noise = pow(10.0, -0.3 * (c->vbr_quality - 1));
+    }
     if (hz > rate * 0.48) hz = rate * 0.48;
     e->cutoff = (float)(hz / (rate / 2));
 
@@ -201,7 +233,7 @@ ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
         for (int b = 0; b < 22; b++) e->spread_long[a][b] = (float)spreading(e->bark_long[a] - e->bark_long[b]);
     for (int a = 0; a < 13; a++)
         for (int b = 0; b < 13; b++) e->spread_short[a][b] = (float)spreading(e->bark_short[a] - e->bark_short[b]);
-    for (int ch = 0; ch < 2; ch++)
+    for (int ch = 0; ch < 4; ch++)
         for (int b = 0; b < 22; b++) e->prev_xmin[ch][b] = 1e30f;
     e->pe_average = 0;
     return e;
@@ -529,15 +561,16 @@ static int fit_gain(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G, int targe
 
 /* Outer loop: shapes the noise under the masking threshold by raising the
    scale factors of bands that are too noisy, keeping the best attempt. */
-static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, ahmp3_gr *G, int target)
+/* Gets a granule ready for the loops: |xr|^(3/4) with the lowpass applied,
+   and its side information cleared. */
+static void prepare(const ahmp3_encoder *e, const float xr[576], ahmp3_gr *G, qin *q)
 {
-    qin q;
-    q.xr = xr;
-    q.xmax34 = 0;
-    q.cut = G->block_type == 2 ? 576 : (int)(e->cutoff * 576);
+    q->xr = xr;
+    q->xmax34 = 0;
+    q->cut = G->block_type == 2 ? 576 : (int)(e->cutoff * 576);
     for (int j = 0; j < 576; j++) {
-        q.xr34[j] = (float)pow(fabs(xr[j]), 0.75);
-        if (q.xr34[j] > q.xmax34) q.xmax34 = q.xr34[j];
+        q->xr34[j] = (float)pow(fabs(xr[j]), 0.75);
+        if (q->xr34[j] > q->xmax34) q->xmax34 = q->xr34[j];
     }
     if (G->block_type == 2) {
         /* Short blocks: the lowpass applies within each window. */
@@ -547,12 +580,120 @@ static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, a
             int len = ss[b + 1] - ss[b];
             for (int w = 0; w < 3; w++)
                 for (int j = 0; j < len; j++)
-                    if (ss[b] + j >= cut) q.xr34[3 * ss[b] + w * len + j] = 0;
+                    if (ss[b] + j >= cut) q->xr34[3 * ss[b] + w * len + j] = 0;
         }
     }
     memset(G->sf, 0, sizeof(G->sf));
     G->scalefac_scale = 0;
     G->preflag = 0;
+}
+
+static void silence(const ahmp3_encoder *e, ahmp3_gr *G)
+{
+    memset(G->ix, 0, sizeof(G->ix));
+    memset(G->sf, 0, sizeof(G->sf));
+    G->global_gain = 0;
+    G->scalefac_scale = 0;
+    G->part23 = granule_bits(e, G, true);
+}
+
+/* Variable bit rate: every band gets the coarsest step that keeps its noise
+   under the masking threshold, and the granule takes however many bits that
+   costs, up to max_bits. */
+static void code_granule_vbr(ahmp3_encoder *e, const float xr[576], const mask *m, ahmp3_gr *G, int max_bits)
+{
+    qin q;
+    prepare(e, xr, G, &q);
+    if (max_bits > 4095) max_bits = 4095;
+    if (q.xmax34 == 0 || max_bits < 16) {
+        silence(e, G);
+        return;
+    }
+    int bands = 0, steps[39], need[39];
+    bool live[39];
+    band_steps(e, G, steps, &bands);
+    int counted = G->long_end == 22 ? 21 : bands - 3; /* the last band has no scale factor */
+    int global = -1;
+    for (int n = 0; n < bands; n++) {
+        int s, t;
+        band_lines(e, G, n, &s, &t);
+        double allowed = e->vbr_noise * (n < G->long_end ? m->xmin[n] : m->xmin_s[G->short_start + (n - G->long_end) / 3][(n - G->long_end) % 3]);
+        /* The largest gain (coarsest step) whose noise stays under the
+           threshold. A band quieter than its threshold needs nothing; one
+           that cannot get under it takes the finest step its largest value
+           allows. */
+        float top = 0;
+        for (int j = s; j < t; j++)
+            if (j < q.cut && q.xr34[j] > top) top = q.xr34[j];
+        int finest = 0;
+        if (top > 0) {
+            finest = 210 + (int)ceil(16.0 / 3 * log2(top / 8205.0));
+            if (finest < 0) finest = 0;
+        }
+        int lo = finest, hi = 255, best = finest;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            float fq = (float)pow(2.0, -3.0 * (mid - 210) / 16), fr = (float)pow(2.0, (mid - 210) / 4.0);
+            double sum = 0;
+            for (int j = s; j < t && sum <= allowed; j++) {
+                if (q.xr34[j] == 0 || j >= q.cut) continue; /* removed by the lowpass */
+                float v = q.xr34[j] * fq + 0.4054f;
+                if (v > 8206) {
+                    sum = 1e300;
+                    break;
+                }
+                double d = fabs(xr[j]) - e->t.pow43[(int)v] * fr;
+                sum += d * d;
+            }
+            if (sum <= allowed) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        live[n] = best < 255;
+        need[n] = best;
+        if (live[n] && need[n] > global) global = need[n];
+    }
+    if (global < 0) {
+        silence(e, G);
+        return;
+    }
+    for (int n = counted; n < bands; n++)
+        if (live[n] && need[n] < global) global = need[n];
+    /* Scale factors make up the difference between the global gain and each
+       band's own. When they cannot reach, the global gain comes down and the
+       other bands are coded finer than they needed. */
+    int shift = 1;
+    for (;; shift++) {
+        bool reach = true;
+        for (int n = 0; n < counted; n++)
+            if (live[n] && need[n] < global && ((global - need[n] + (1 << shift) - 1) >> shift) > ahmp3_sf_limit(G, e->lsf, n)) reach = false;
+        if (reach || shift == 2) break;
+    }
+    for (int n = 0; n < counted; n++) {
+        int cap = need[n] + (ahmp3_sf_limit(G, e->lsf, n) << shift);
+        if (live[n] && cap < global) global = cap;
+    }
+    G->scalefac_scale = shift - 1;
+    for (int n = 0; n < counted; n++)
+        G->sf[n] = (unsigned char)(live[n] && need[n] < global ? (global - need[n] + (1 << shift) - 1) >> shift : 0);
+    G->global_gain = global;
+    while (!quantize(e, &q, G) && G->global_gain < 255) G->global_gain++;
+    int bits = granule_bits(e, G, true);
+    if (bits > max_bits) {
+        /* More than the frame can carry: coarsen until it fits. */
+        fit_gain(e, &q, G, max_bits);
+        bits = granule_bits(e, G, true);
+    }
+    G->part23 = bits;
+}
+
+static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, ahmp3_gr *G, int target)
+{
+    qin q;
+    prepare(e, xr, G, &q);
     if (target > 4095) target = 4095;
     if (q.xmax34 == 0 || target < 16) {
         memset(G->ix, 0, sizeof(G->ix));
@@ -638,6 +779,13 @@ static int frame_bytes_next(ahmp3_encoder *e, int *padding)
     return e->frame_base + *padding;
 }
 
+/* Frame size at a bit rate, with no padding: variable bit rate has no
+   average to keep. */
+static int vbr_frame_bytes(const ahmp3_encoder *e, int bitrate_index)
+{
+    return (e->lsf ? 72000 : 144000) * ahmp3_bitrates[e->lsf][bitrate_index] / ahmp3_sample_rates[e->sr_index];
+}
+
 /* Moves finished frames to out. A frame is finished once the main data
    that fills its slot is known. */
 static size_t emit(ahmp3_encoder *e, uint8_t *out, size_t cap, bool all)
@@ -649,6 +797,16 @@ static size_t emit(ahmp3_encoder *e, uint8_t *out, size_t cap, bool all)
         pending *p = &e->frames[i];
         if (!all && e->fifo_len - used < p->slot) break;
         if (written + (size_t)p->head_bytes + (size_t)p->slot > cap) break;
+        size_t frame_start = written;
+        if (e->frames_out % (uint32_t)e->seek_stride == 0) {
+            if (e->seek_count == 256) {
+                /* Full: keep every other entry and note frames half as often. */
+                for (int k = 0; k < 128; k++) e->seek[k] = e->seek[2 * k];
+                e->seek_count = 128;
+                e->seek_stride *= 2;
+            }
+            if (e->frames_out % (uint32_t)e->seek_stride == 0) e->seek[e->seek_count++] = e->bytes_out;
+        }
         memcpy(out + written, p->head, (size_t)p->head_bytes);
         written += (size_t)p->head_bytes;
         int have = e->fifo_len - used;
@@ -658,6 +816,9 @@ static size_t emit(ahmp3_encoder *e, uint8_t *out, size_t cap, bool all)
         written += (size_t)p->slot;
         used += take;
         e->slots_pending -= p->slot;
+        e->frames_out++;
+        e->bytes_out += written - frame_start;
+        e->music_crc = crc_a001(e->music_crc, out + frame_start, written - frame_start);
     }
     memmove(e->frames, e->frames + i, (size_t)(e->frame_count - i) * sizeof(pending));
     e->frame_count -= i;
@@ -689,8 +850,11 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
     (void)dummy;
     ahmp3_fr fr;
     memset(&fr, 0, sizeof(fr));
-    int padding;
-    int bytes = frame_bytes_next(e, &padding);
+    int padding = 0;
+    int side = e->lsf ? (e->channels == 1 ? 9 : 17) : (e->channels == 1 ? 17 : 32);
+    /* Variable bit rate: code with the biggest frame allowed as the limit,
+       then pick the smallest frame that holds the result. */
+    int bytes = e->vbr ? vbr_frame_bytes(e, e->bitrate_index) : frame_bytes_next(e, &padding);
     fr.lsf = e->lsf;
     fr.sr_index = e->sr_index;
     fr.bitrate_index = e->bitrate_index;
@@ -698,7 +862,6 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
     fr.mode = e->mode;
     fr.channels = e->channels;
     fr.granules = e->granules;
-    int side = e->lsf ? (e->channels == 1 ? 9 : 17) : (e->channels == 1 ? 17 : 32);
     int slot = bytes - 4 - side;
 
     /* Reservoir: bytes queued for earlier frames' slots that are still free. */
@@ -749,8 +912,27 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
                     float t = m[g][0].xmin_s[b][w] < m[g][1].xmin_s[b][w] ? m[g][0].xmin_s[b][w] : m[g][1].xmin_s[b][w];
                     m[g][0].xmin_s[b][w] = m[g][1].xmin_s[b][w] = t;
                 }
+            if (!e->vbr) continue;
+            /* Variable bit rate codes each band only as finely as its
+               threshold asks, so the side channel needs one of its own: under
+               the left/right threshold alone it would often be dropped
+               whole, and the stereo picture with it. */
+            for (int ch = 0; ch < 2; ch++) {
+                mask own;
+                if (!e->prev_ms)
+                    for (int b = 0; b < 22; b++) e->prev_xmin[2 + ch][b] = 1e30f;
+                if (block_types[g] == 2) mask_short(e, 2 + ch, xr[g][ch], &own);
+                else mask_long(e, 2 + ch, xr[g][ch], &own);
+                for (int b = 0; b < 22; b++)
+                    if (own.xmin[b] < m[g][ch].xmin[b]) m[g][ch].xmin[b] = own.xmin[b];
+                for (int b = 0; b < 13; b++)
+                    for (int w = 0; w < 3; w++)
+                        if (own.xmin_s[b][w] < m[g][ch].xmin_s[b][w]) m[g][ch].xmin_s[b][w] = own.xmin_s[b][w];
+            }
+            e->prev_ms = true;
         }
     }
+    if (!ms) e->prev_ms = false;
 
     /* Share the bits: an even split, moved toward the granules and channels
        that need more, while keeping some reservoir for hard passages. */
@@ -780,9 +962,30 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
             G->window_switching = block_types[g] != 0;
             G->long_end = block_types[g] == 2 ? 0 : 22;
             G->short_start = block_types[g] == 2 ? 0 : 13;
-            code_granule(e, xr[g][ch], &m[g][ch], G, target);
+            if (e->vbr) code_granule_vbr(e, xr[g][ch], &m[g][ch], G, 4095);
+            else code_granule(e, xr[g][ch], &m[g][ch], G, target);
             remaining -= G->part23;
         }
+    }
+    if (e->vbr && remaining < 0) {
+        /* The frame wants more than the biggest one holds: every part gives
+           up the same share. */
+        int wanted = budget - remaining;
+        remaining = budget;
+        for (int i = 0; i < parts; i++) {
+            ahmp3_gr *G = &fr.gr[i / e->channels][i % e->channels];
+            int limit = (int)((long long)G->part23 * budget / wanted);
+            code_granule_vbr(e, xr[i / e->channels][i % e->channels], &m[i / e->channels][i % e->channels], G, limit);
+            remaining -= G->part23;
+        }
+    }
+    if (e->vbr) {
+        int used_bytes = (budget - remaining + 7) / 8 - free_before;
+        int br = 1;
+        while (br < e->bitrate_index && vbr_frame_bytes(e, br) - 4 - side < used_bytes) br++;
+        fr.bitrate_index = br;
+        remaining -= (slot - (vbr_frame_bytes(e, br) - 4 - side)) * 8;
+        slot = vbr_frame_bytes(e, br) - 4 - side;
     }
     /* Never more than the frame can carry: silence granules from the end
        until it fits. Only a pathological input could need this. */
@@ -915,8 +1118,105 @@ size_t ahmp3_encoder_flush(ahmp3_encoder *e, uint8_t *out, size_t out_cap)
            the lookahead granule and the last frame. */
         float zero[2 * 576] = {0};
         int granules = 4 + e->granules;
+        long long samples_in = e->samples_in;
         for (int i = 0; i < granules; i++) written += ahmp3_encode(e, zero, 576, out + written, out_cap - written);
+        e->samples_in = samples_in; /* the silence is not the caller's input */
     }
     written += emit(e, out + written, out_cap - written, true);
     return written;
+}
+
+/* ---- info frame ---------------------------------------------------------------- */
+
+static void put_be32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+/* The frame that holds the tag: the stream's own bit rate when the tag fits
+   in it, else the lowest one that is big enough. Returns its bytes. */
+static int info_frame_layout(const ahmp3_encoder *e, int *bitrate_index, int *side)
+{
+    *side = e->lsf ? (e->channels == 1 ? 9 : 17) : (e->channels == 1 ? 17 : 32);
+    int need = 4 + *side + 120 + 36;
+    for (int br = e->vbr ? 1 : e->bitrate_index; br < 15; br++) {
+        int bytes = (e->lsf ? 72000 : 144000) * ahmp3_bitrates[e->lsf][br] / ahmp3_sample_rates[e->sr_index];
+        if (bytes >= need) {
+            *bitrate_index = br;
+            return bytes;
+        }
+    }
+    return 0;
+}
+
+size_t ahmp3_encoder_info_frame(const ahmp3_encoder *e, uint8_t *out, size_t out_cap)
+{
+    int br = 0, side = 0;
+    int bytes = info_frame_layout(e, &br, &side);
+    if (!bytes || out_cap < (size_t)bytes) return 0;
+    memset(out, 0, (size_t)bytes);
+
+    ahmp3_fr fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.lsf = e->lsf;
+    fr.sr_index = e->sr_index;
+    fr.bitrate_index = br;
+    fr.mode = e->mode;
+    fr.channels = e->channels;
+    fr.granules = e->granules;
+    unsigned char head[40];
+    ahmp3_write_header(&fr, head);
+    memcpy(out, head, 4); /* the side information stays zero: a silent frame */
+
+    unsigned char *p = out + 4 + side;
+    uint64_t total = e->bytes_out + (uint64_t)bytes;
+    uint32_t total32 = total > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)total;
+    memcpy(p, e->vbr ? "Xing" : "Info", 4);
+    put_be32(p + 4, 0x0F); /* frames, bytes, seek table and quality follow */
+    put_be32(p + 8, e->frames_out);
+    put_be32(p + 12, total32);
+    /* Seek table: where in the file each hundredth of the playing time
+       starts, as a fraction of 256. */
+    for (int i = 0; i < 100; i++) {
+        uint64_t at = 0;
+        if (e->seek_count) {
+            uint64_t frame = (uint64_t)i * e->frames_out / 100;
+            int k = (int)(frame / (uint64_t)e->seek_stride);
+            if (k >= e->seek_count) k = e->seek_count - 1;
+            at = (e->seek[k] + (uint64_t)bytes) * 256 / total;
+        }
+        p[16 + i] = (unsigned char)(at > 255 ? 255 : at);
+    }
+    put_be32(p + 116, (uint32_t)(e->vbr ? e->vbr * 10 : 0));
+
+    /* The LAME tag. Its name starts with "LAME" because players look for
+       that before they trust the delay and padding further down. */
+    unsigned char *t = p + 120;
+    memcpy(t, "LAMEahmp3", 9);
+    t[9] = e->vbr ? 3 : 1; /* tag revision 0; variable or constant bit rate */
+    double lowpass = e->cutoff * ahmp3_sample_rates[e->sr_index] / 2 / 100;
+    t[10] = (unsigned char)(lowpass > 255 ? 255 : lowpass);
+    /* 11..18: peak level and replay gain, not measured. 19: flags, none. */
+    int kbps = ahmp3_bitrates[e->lsf][e->vbr ? 1 : e->bitrate_index];
+    t[20] = (unsigned char)(kbps > 255 ? 255 : kbps);
+    int delay = ahmp3_encoder_delay(e);
+    long long padding = (long long)e->frames_out * (e->lsf ? 576 : 1152) - delay - e->samples_in;
+    if (padding < 0) padding = 0;
+    if (padding > 4095) padding = 4095;
+    t[21] = (unsigned char)(delay >> 4);
+    t[22] = (unsigned char)((delay & 15) << 4 | (int)(padding >> 8));
+    t[23] = (unsigned char)padding;
+    int rate = ahmp3_sample_rates[e->sr_index];
+    int stereo_mode = e->mode == 3 ? 0 : e->mode == 0 ? 1 : 3;
+    t[24] = (unsigned char)(stereo_mode << 2 | (rate <= 32000 ? 0 : rate == 44100 ? 1 : 2) << 6);
+    put_be32(t + 28, total32);
+    t[32] = (unsigned char)(e->music_crc >> 8);
+    t[33] = (unsigned char)e->music_crc;
+    uint16_t crc = crc_a001(0, out, (size_t)(t + 34 - out));
+    t[34] = (unsigned char)(crc >> 8);
+    t[35] = (unsigned char)crc;
+    return (size_t)bytes;
 }

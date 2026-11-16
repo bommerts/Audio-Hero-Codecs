@@ -9,6 +9,13 @@ const int ahmp3_bitrates[2][15] = {
     {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
 };
 
+const int ahmp3_bitrates_12[2][2][15] = {
+    {{0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448},
+     {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384}},
+    {{0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256},
+     {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160}},
+};
+
 const short ahmp3_sfb_long[9][23] = {
     {0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576},
     {0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576},
@@ -107,39 +114,58 @@ bool ahmp3_read_header(const unsigned char *p, ahmp3_header *h)
 {
     if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return false;
     int version = (p[1] >> 3) & 3; /* 0 = 2.5, 1 reserved, 2 = MPEG-2, 3 = MPEG-1 */
-    int layer = (p[1] >> 1) & 3;   /* 1 = Layer III */
+    int layer = 4 - ((p[1] >> 1) & 3);
     int br = p[2] >> 4, sr = (p[2] >> 2) & 3;
-    if (version == 1 || layer != 1 || br == 0 || br == 15 || sr == 3) return false;
+    if (version == 1 || layer == 4 || br == 15 || sr == 3) return false;
     memset(h, 0, sizeof(*h));
     h->lsf = version != 3;
     h->mpeg25 = version == 0;
+    h->layer = layer;
     h->sr_index = sr + (version == 3 ? 0 : version == 2 ? 3 : 6);
     h->bitrate_index = br;
+    h->free_format = br == 0;
     h->crc = !(p[1] & 1);
     h->padding = (p[2] >> 1) & 1;
     h->mode = p[3] >> 6;
     h->mode_ext = (p[3] >> 4) & 3;
     h->channels = h->mode == 3 ? 1 : 2;
+    h->samples = layer == 1 ? 384 : layer == 2 || !h->lsf ? 1152 : 576;
     int rate = ahmp3_sample_rates[h->sr_index];
-    int kbps = ahmp3_bitrates[h->lsf][br];
-    h->frame_bytes = (h->lsf ? 72000 : 144000) * kbps / rate + h->padding;
-    h->side_bytes = h->lsf ? (h->channels == 1 ? 9 : 17) : (h->channels == 1 ? 17 : 32);
+    h->kbps = layer == 3 ? ahmp3_bitrates[h->lsf][br] : ahmp3_bitrates_12[h->lsf][layer - 1][br];
+    if (layer == 3) h->side_bytes = h->lsf ? (h->channels == 1 ? 9 : 17) : (h->channels == 1 ? 17 : 32);
+    if (h->free_format) return true;
+    if (layer == 1) h->frame_bytes = (12000 * h->kbps / rate + h->padding) * 4;
+    else h->frame_bytes = (h->samples == 576 ? 72000 : 144000) * h->kbps / rate + h->padding;
     return h->frame_bytes > 4 + 2 * h->crc + h->side_bytes;
+}
+
+void ahmp3_fill_frame(const ahmp3_header *h, ahmp3_frame *frame)
+{
+    frame->version = h->mpeg25 ? 25 : h->lsf ? 2 : 1;
+    frame->layer = h->layer;
+    frame->sample_rate = ahmp3_sample_rates[h->sr_index];
+    frame->channels = h->channels;
+    frame->bitrate_kbps = h->kbps;
+    frame->frame_bytes = h->frame_bytes;
+    frame->samples = h->samples;
+    frame->crc_error = false;
 }
 
 bool ahmp3_parse_header(const uint8_t *data, size_t len, ahmp3_frame *frame)
 {
     ahmp3_header h;
     if (len < 4 || !ahmp3_read_header(data, &h)) return false;
-    if (frame) {
-        frame->version = h.mpeg25 ? 25 : h.lsf ? 2 : 1;
-        frame->sample_rate = ahmp3_sample_rates[h.sr_index];
-        frame->channels = h.channels;
-        frame->bitrate_kbps = ahmp3_bitrates[h.lsf][h.bitrate_index];
-        frame->frame_bytes = h.frame_bytes;
-        frame->samples = h.lsf ? 576 : 1152;
-    }
+    if (frame) ahmp3_fill_frame(&h, frame);
     return true;
+}
+
+unsigned ahmp3_crc16(unsigned crc, const unsigned char *p, size_t bits)
+{
+    for (size_t i = 0; i < bits; i++) {
+        unsigned bit = (p[i >> 3] >> (7 - (i & 7))) & 1;
+        crc = ((crc >> 15) ^ bit) & 1 ? ((crc << 1) ^ 0x8005) & 0xFFFF : (crc << 1) & 0xFFFF;
+    }
+    return crc;
 }
 
 size_t ahmp3_id3v2_size(const uint8_t *d, size_t len)

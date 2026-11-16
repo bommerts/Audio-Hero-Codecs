@@ -4,73 +4,54 @@
    used only here, as an independent reference decoder and as a source of
    files from other encoders. */
 #include "../src/ahmp3_bitstream.h"
-#include <stdio.h>
+#include "common.h"
 
-static int g_checks, g_failures;
+int g_checks, g_failures;
+bool g_ffmpeg;
 static char g_dir[512];
-static bool g_ffmpeg;
 enum { F_SWITCH = 1, F_MIXED = 2, F_MS = 4, F_IS = 8, F_SCFSI = 16, F_PREFLAG = 32, F_SUBGAIN = 64, F_SFSCALE = 128, F_TABLES = 256, F_DUAL = 512, F_SF = 1024, F_ALL = 2047 };
 static int g_features = F_ALL;
 static int g_force_type = -1;
-
-#define CHECK(cond, ...)                                     \
-    do {                                                     \
-        g_checks++;                                          \
-        if (!(cond)) {                                       \
-            g_failures++;                                    \
-            printf("FAIL %s:%d  ", __FILE__, __LINE__);      \
-            printf(__VA_ARGS__);                             \
-            printf("\n");                                    \
-        }                                                    \
-    } while (0)
+static int g_crc;        /* test frames carry a CRC */
+static int g_free_bytes; /* test frames are free format, of this size */
+static pcm *g_keep;      /* test_random_frames leaves its decoded sound here */
 
 /* ---- helpers --------------------------------------------------------------- */
 
-static unsigned g_seed = 12345;
-static unsigned rnd(void)
+unsigned g_seed = 12345;
+unsigned rnd(void)
 {
     g_seed = g_seed * 1103515245u + 12345u;
     return (g_seed >> 8) & 0xFFFFFF;
 }
-static int rnd_in(int lo, int hi) { return lo + (int)(rnd() % (unsigned)(hi - lo + 1)); }
+int rnd_in(int lo, int hi) { return lo + (int)(rnd() % (unsigned)(hi - lo + 1)); }
 
-typedef struct {
-    unsigned char *p;
-    size_t len, cap;
-} bytes;
-
-static void bytes_put(bytes *b, const void *d, size_t n)
+void bytes_put(bytes *b, const void *d, size_t n)
 {
     if (b->len + n > b->cap) {
         b->cap = (b->len + n) * 2;
         b->p = realloc(b->p, b->cap);
     }
-    memcpy(b->p + b->len, d, n);
+    if (n) memcpy(b->p + b->len, d, n);
     b->len += n;
 }
 
-typedef struct {
-    float *p;
-    size_t len, cap; /* floats */
-    int channels, rate;
-} pcm;
-
-static void pcm_put(pcm *s, const float *d, size_t n)
+void pcm_put(pcm *s, const float *d, size_t n)
 {
     if (s->len + n > s->cap) {
         s->cap = (s->len + n) * 2;
         s->p = realloc(s->p, s->cap * sizeof(float));
     }
-    memcpy(s->p + s->len, d, n * sizeof(float));
+    if (n) memcpy(s->p + s->len, d, n * sizeof(float));
     s->len += n;
 }
 
-static void path_of(char *out, const char *name)
+void path_of(char *out, const char *name)
 {
     snprintf(out, 600, "%s/%s", g_dir, name);
 }
 
-static bool write_file(const char *path, const void *d, size_t n)
+bool write_file(const char *path, const void *d, size_t n)
 {
     FILE *f = fopen(path, "wb");
     if (!f) return false;
@@ -79,7 +60,7 @@ static bool write_file(const char *path, const void *d, size_t n)
     return ok;
 }
 
-static bool read_file(const char *path, bytes *out)
+bool read_file(const char *path, bytes *out)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -89,6 +70,22 @@ static bool read_file(const char *path, bytes *out)
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) bytes_put(out, buf, n);
     fclose(f);
     return true;
+}
+
+bool ffmpeg_run(const char *args)
+{
+    char cmd[4000];
+    snprintf(cmd, sizeof(cmd), "ffmpeg -v error -nostdin -y %s", args);
+    return system(cmd) == 0;
+}
+
+bool ffmpeg_raw(const char *in_path, const char *extra, const char *format, bytes *out)
+{
+    char raw[700], args[2000];
+    snprintf(raw, sizeof(raw), "%s.%s", in_path, format);
+    snprintf(args, sizeof(args), "%s -i \"%s\" -f %s \"%s\"", extra ? extra : "", in_path, format, raw);
+    out->len = 0;
+    return ffmpeg_run(args) && read_file(raw, out);
 }
 
 static void decode_all(const unsigned char *d, size_t len, pcm *out, ahmp3_info *info)
@@ -116,20 +113,15 @@ static void decode_all(const unsigned char *d, size_t len, pcm *out, ahmp3_info 
 /* ffmpeg's own floating point decoder, as raw interleaved floats. */
 static bool ffmpeg_decode(const char *mp3_path, pcm *out)
 {
-    char raw[600], cmd[1500];
-    snprintf(raw, sizeof(raw), "%s.f32", mp3_path);
-    snprintf(cmd, sizeof(cmd), "ffmpeg -v error -nostdin -y -c:a mp3float -i \"%s\" -f f32le \"%s\"", mp3_path, raw);
-    if (system(cmd) != 0) return false;
     bytes b = {0};
-    if (!read_file(raw, &b)) return false;
+    if (!ffmpeg_raw(mp3_path, "-c:a mp3float", "f32le", &b)) return false;
     out->len = 0;
     pcm_put(out, (const float *)b.p, b.len / 4);
     free(b.p);
     return true;
 }
 
-/* Largest difference, relative to the louder signal, in samples [from, to). */
-static double max_diff(const pcm *a, const pcm *b, size_t from, size_t to)
+double max_diff(const pcm *a, const pcm *b, size_t from, size_t to)
 {
     double diff = 0, peak = 1e-9;
     for (size_t i = from; i < to && i < a->len && i < b->len; i++) {
@@ -200,6 +192,7 @@ static void frame_start(ahmp3_fr *f, const stream_kind *k)
 
 static int frame_size(const ahmp3_fr *f)
 {
+    if (!f->bitrate_index) return g_free_bytes + f->padding;
     int rate = ahmp3_sample_rates[f->sr_index], kbps = ahmp3_bitrates[f->lsf][f->bitrate_index];
     return (f->lsf ? 72000 : 144000) * kbps / rate + f->padding;
 }
@@ -219,7 +212,13 @@ static bool frame_write(ahmp3_fr *f, bytes *out)
     int head_bytes = ahmp3_write_header(f, head);
     int main_bytes = (ahmp3_write_main(f, main, sizeof(main)) + 7) / 8;
     if (head_bytes + main_bytes > size) return false;
-    unsigned char frame[2000] = {0};
+    if (g_free_bytes) {
+        /* Keep only what also fits the frame with a stated bit rate, so
+           both streams hold the same frames. */
+        int stated = (f->lsf ? 72000 : 144000) * ahmp3_bitrates[f->lsf][14] / ahmp3_sample_rates[f->sr_index];
+        if (head_bytes - 2 * f->crc + main_bytes > stated) return false;
+    }
+    unsigned char frame[5000] = {0};
     memcpy(frame, head, (size_t)head_bytes);
     memcpy(frame + head_bytes, main, (size_t)main_bytes);
     bytes_put(out, frame, (size_t)size);
@@ -428,6 +427,8 @@ static void test_random_frames(const char *name, stream_kind k, int frames)
         int prev_type[2] = {last_type[0], last_type[1]}, prev_mixed[2] = {last_mixed[0], last_mixed[1]};
         ahmp3_fr f;
         frame_start(&f, &k);
+        f.crc = g_crc;
+        if (g_free_bytes) f.bitrate_index = 0;
         if (k.channels == 2) {
             /* The mode stays the same through a stream, as in real files. */
             if (f.mode == 1) f.mode_ext = ((g_features & F_MS) ? rnd_in(0, 1) * 2 : 0) | ((g_features & F_IS) ? rnd_in(0, 1) : 0);
@@ -466,7 +467,7 @@ static void test_random_frames(const char *name, stream_kind k, int frames)
                 random_scalefactors(&f, g, ch);
             }
         }
-        f.padding = 0;
+        f.padding = g_free_bytes ? (n * 7 + made) % 3 == 0 : 0;
         if (frame_write(&f, &mp3)) {
             made++;
             last_type[0] = prev_type[0];
@@ -481,6 +482,17 @@ static void test_random_frames(const char *name, stream_kind k, int frames)
     write_file(path, mp3.p, mp3.len);
     pcm mine = {0}, ref = {0};
     decode_all(mp3.p, mp3.len, &mine, NULL);
+    if (g_keep) {
+        g_keep->len = 0;
+        pcm_put(g_keep, mine.p, mine.len);
+        CHECK(mine.len == (size_t)made * (size_t)(k.lsf ? 576 : 1152) * (size_t)k.channels, "%s: %zu samples from %d frames", name, mine.len, made);
+    }
+    if (g_free_bytes) {
+        /* ffmpeg does not decode free format. */
+        free(mp3.p);
+        free(mine.p);
+        return;
+    }
     CHECK(ffmpeg_decode(path, &ref), "%s: ffmpeg could not decode", name);
     CHECK(mine.len == ref.len, "%s: lengths differ: %zu vs %zu", name, mine.len, ref.len);
     size_t frame_samples = (size_t)(k.lsf ? 576 : 1152) * k.channels;
@@ -498,9 +510,102 @@ static void test_random_frames(const char *name, stream_kind k, int frames)
     free(ref.p);
 }
 
+/* ---- CRC and free format ---------------------------------------------------- */
+
+/* Frames with a CRC decode as ffmpeg decodes them; one whose protected bytes
+   are damaged is reported and played as silence. */
+static void test_crc(void)
+{
+    g_crc = 1;
+    if (g_ffmpeg) {
+        test_random_frames("crc_mpeg1_stereo.mp3", (stream_kind){0, 0, 14, 2, 1}, 120);
+        test_random_frames("crc_mpeg2_mono.mp3", (stream_kind){1, 3, 14, 1, 3}, 120);
+    }
+    /* Loud frames, then the same with the side information of every third
+       one damaged. */
+    stream_kind k = {0, 0, 14, 2, 0};
+    bytes mp3 = {0};
+    int count = 30, sizes = 0;
+    for (int n = 0; n < count; n++) {
+        ahmp3_fr f;
+        frame_start(&f, &k);
+        f.crc = 1;
+        for (int g = 0; g < 2; g++)
+            for (int ch = 0; ch < 2; ch++) {
+                ahmp3_gr *G = &f.gr[g][ch];
+                G->global_gain = 180;
+                for (int j = 0; j < 40; j++) G->ix[j] = rnd_in(-6, 6);
+                ahmp3_huffman_choose(G, k.sr_index, false);
+            }
+        CHECK(frame_write(&f, &mp3), "CRC test frame does not fit");
+        sizes = (int)mp3.len / (n + 1);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass)
+            for (int n = 0; n < count; n += 3) mp3.p[n * sizes + 6 + rnd_in(0, 31)] ^= (unsigned char)(1 << rnd_in(0, 7));
+        ahmp3_decoder *d = ahmp3_decoder_new();
+        size_t pos = 0;
+        int errors = 0, frames = 0, wrong = 0;
+        for (;;) {
+            float buf[AHMP3_MAX_SAMPLES * 2];
+            int n;
+            ahmp3_frame fr;
+            size_t used = ahmp3_decode(d, mp3.p + pos, mp3.len - pos, true, buf, &n, &fr);
+            if (!used) break;
+            pos += used;
+            if (!n) continue;
+            double energy = 0;
+            for (int i = 2 * 1100; i < 2 * 1152; i++) energy += (double)buf[i] * buf[i];
+            if (fr.crc_error) errors++;
+            /* Past the filter's memory of the frame before, a failed frame
+               is silent and a good one is not. */
+            if (fr.crc_error != (energy < 1e-12)) wrong++;
+            if (fr.crc_error != (pass && frames % 3 == 0)) wrong++;
+            frames++;
+        }
+        ahmp3_decoder_free(d);
+        CHECK(frames == count && errors == (pass ? count / 3 : 0) && !wrong, "CRC pass %d: %d frames, %d CRC errors, %d wrong", pass, frames,
+              errors, wrong);
+    }
+    free(mp3.p);
+    g_crc = 0;
+}
+
+/* Free format: the same frames written with a stated bit rate and as
+   free-format frames of other sizes decode to the same sound. */
+static void test_free_format(void)
+{
+    static const struct {
+        stream_kind kind;
+        int bytes;
+    } cases[] = {
+        {{0, 0, 14, 2, 1}, 1500}, {{0, 0, 14, 2, 1}, 2880}, {{0, 2, 14, 1, 3}, 1441}, {{0, 1, 14, 2, 1}, 4000},
+        {{1, 3, 14, 2, 1}, 700},  {{1, 8, 14, 2, 1}, 1700}, {{1, 4, 14, 1, 3}, 577},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        pcm stated = {0}, free_format = {0};
+        unsigned seed = g_seed;
+        g_keep = &stated;
+        test_random_frames("free_stated.mp3", cases[c].kind, 60);
+        g_seed = seed;
+        g_keep = &free_format;
+        g_free_bytes = cases[c].bytes;
+        g_crc = (int)(c & 1);
+        test_random_frames("free_format.mp3", cases[c].kind, 60);
+        g_free_bytes = 0;
+        g_crc = 0;
+        g_keep = NULL;
+        CHECK(stated.len == free_format.len && stated.len > 0 && !memcmp(stated.p, free_format.p, stated.len * sizeof(float)),
+              "free format case %zu: decodes differently from the same frames with a bit rate (%zu vs %zu samples)", c, free_format.len,
+              stated.len);
+        free(stated.p);
+        free(free_format.p);
+    }
+}
+
 /* ---- files from other encoders --------------------------------------------- */
 
-static void make_source(void)
+void make_source(void)
 {
     char path[600], cmd[2000];
     path_of(path, "source.wav");
@@ -601,12 +706,19 @@ static void signal(float *x, size_t frames, int channels, int rate, int kind)
                 v = 0.01 * sin(2 * AHMP3_PI * 300 * t) + (fmod(t, 0.25) < 0.004 ? 0.8 * sin(2 * AHMP3_PI * 2500 * t) : 0);
                 break;
             case 3: v = 0; break; /* silence */
+            case 5: /* a mix that changes: tones that come and go, noise bursts, clicks, a quiet stretch */
+                v = 0.3 * sin(2 * AHMP3_PI * (300 + 200 * ch) * t) * (fmod(t, 0.9) < 0.6) + 0.2 * sin(2 * AHMP3_PI * 3100 * t) * (fmod(t, 0.37) < 0.2) +
+                    (fmod(t, 0.7) > 0.55 ? ((rnd() & 0xFFFF) / 65536.0 - 0.5) * 0.3 : 0) + (fmod(t, 0.31) < 0.003 ? 0.5 * sin(2 * AHMP3_PI * 5000 * t) : 0);
+                if (t > 1.9 && t < 2.2) v *= 0.01;
+                break;
             default: v = ((i / 40) & 1) ? 0.99 : -0.99; break; /* full-scale square */
             }
             x[i * channels + ch] = (float)v;
         }
     }
 }
+
+static int g_round_trip_vbr; /* the variable bit rate quality round_trip uses, 0 = constant */
 
 /* Encodes, then decodes with this decoder; quality against the input. */
 static quality round_trip(int rate, int channels, int kbps, ahmp3_mode mode, int kind, bytes *mp3)
@@ -615,7 +727,7 @@ static quality round_trip(int rate, int channels, int kbps, ahmp3_mode mode, int
     size_t frames = (size_t)rate * 3;
     float *x = malloc(frames * channels * sizeof(float));
     signal(x, frames, channels, rate, kind);
-    ahmp3_encoder_config cfg = {rate, channels, kbps, mode};
+    ahmp3_encoder_config cfg = {rate, channels, kbps, mode, g_round_trip_vbr};
     ahmp3_encoder *e = ahmp3_encoder_new(&cfg);
     CHECK(e != NULL, "encoder refused %d Hz %d kbps", rate, kbps);
     if (!e) { free(x); return q; }
@@ -730,6 +842,196 @@ static void test_encoder(void)
         }
     }
     free(mp3.p);
+}
+
+/* Walks a stream frame by frame: false when it is not a clean run of frames.
+   Gives the number of frames, the lowest and highest bit rate, and how many
+   different ones there were. */
+static bool walk_frames(const bytes *mp3, size_t *frames, int *low, int *high, int *kinds)
+{
+    bool seen[400] = {false};
+    size_t pos = 0;
+    *frames = 0;
+    *low = 1000;
+    *high = 0;
+    *kinds = 0;
+    while (pos + 4 <= mp3->len) {
+        ahmp3_frame fr;
+        if (!ahmp3_parse_header(mp3->p + pos, mp3->len - pos, &fr) || !fr.frame_bytes) return false;
+        pos += (size_t)fr.frame_bytes;
+        (*frames)++;
+        if (fr.bitrate_kbps < *low) *low = fr.bitrate_kbps;
+        if (fr.bitrate_kbps > *high) *high = fr.bitrate_kbps;
+        if (!seen[fr.bitrate_kbps]) (*kinds)++;
+        seen[fr.bitrate_kbps] = true;
+    }
+    return pos == mp3->len;
+}
+
+static void test_vbr(void)
+{
+    bytes mp3 = {0};
+    size_t frames;
+    int low, high, kinds;
+
+    /* More quality costs more bits and gives less noise; frames differ in
+       size; ffmpeg decodes the stream exactly as this decoder does. */
+    double last_snr = 0, last_kbps = 0;
+    for (int level = 1; level <= 10; level += 3) {
+        g_round_trip_vbr = level;
+        quality q = round_trip(44100, 2, 0, AHMP3_JOINT_STEREO, 5, &mp3);
+        bool clean = walk_frames(&mp3, &frames, &low, &high, &kinds);
+        double kbps = (double)mp3.len * 8 / 3 / 1000;
+        printf("  quality %2d: %.0f kbps (frames from %d to %d), SNR %.1f dB\n", level, kbps, low, high, q.snr_db);
+        CHECK(clean && frames > 100, "VBR quality %d: the stream is not a clean run of frames", level);
+        CHECK(kinds >= 3, "VBR quality %d: only %d different frame sizes", level, kinds);
+        CHECK(kbps > last_kbps * 1.1 && q.snr_db > last_snr + 0.2, "VBR quality %d: %.0f kbps and %.1f dB, no better than the step below (%.0f, %.1f)",
+              level, kbps, q.snr_db, last_kbps, last_snr);
+        last_kbps = kbps;
+        last_snr = q.snr_db;
+        if (g_ffmpeg) {
+            char path[600], name[64], cmd[1500], log_path[620];
+            snprintf(name, sizeof(name), "vbr_%d.mp3", level);
+            path_of(path, name);
+            write_file(path, mp3.p, mp3.len);
+            pcm mine = {0}, ref = {0};
+            decode_all(mp3.p, mp3.len, &mine, NULL);
+            CHECK(ffmpeg_decode(path, &ref) && mine.len == ref.len && max_diff(&ref, &mine, 0, ref.len) < 1e-4,
+                  "%s: ffmpeg decodes it differently", name);
+            snprintf(log_path, sizeof(log_path), "%s.log", path);
+            snprintf(cmd, sizeof(cmd), "ffmpeg -v error -xerror -nostdin -y -i \"%s\" -f null - 2> \"%s\"", path, log_path);
+            int rc = system(cmd);
+            bytes log = {0};
+            read_file(log_path, &log);
+            CHECK(rc == 0 && log.len == 0, "%s: ffmpeg reports errors in it", name);
+            free(log.p);
+            free(mine.p);
+            free(ref.p);
+        }
+    }
+
+    /* A limit on the bit rate is kept; silence takes the smallest frames. */
+    g_round_trip_vbr = 10;
+    round_trip(44100, 2, 128, AHMP3_JOINT_STEREO, 5, &mp3);
+    CHECK(walk_frames(&mp3, &frames, &low, &high, &kinds) && high <= 128, "VBR with a 128 kbps limit used %d kbps", high);
+    quality q = round_trip(44100, 2, 0, AHMP3_JOINT_STEREO, 3, &mp3);
+    CHECK(walk_frames(&mp3, &frames, &low, &high, &kinds) && high == 32 && q.snr_db > 100, "VBR silence used %d kbps frames", high);
+
+    /* Other sample rates, mono, and hard material. */
+    static const struct {
+        int rate, channels, kind;
+    } cases[] = {{48000, 2, 1}, {32000, 1, 2}, {22050, 2, 5}, {16000, 1, 4}, {8000, 2, 5}, {44100, 2, 4}, {11025, 1, 1}};
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        g_round_trip_vbr = 2 + (int)c;
+        q = round_trip(cases[c].rate, cases[c].channels, 0, cases[c].channels == 1 ? AHMP3_MONO : AHMP3_JOINT_STEREO, cases[c].kind, &mp3);
+        CHECK(walk_frames(&mp3, &frames, &low, &high, &kinds) && frames > 30, "VBR %d Hz: the stream is not a clean run of frames", cases[c].rate);
+        CHECK(q.snr_db > (cases[c].kind == 1 ? 1.0 : 8.0), "VBR %d Hz kind %d comes back at only %.1f dB", cases[c].rate, cases[c].kind, q.snr_db);
+        if (g_ffmpeg) {
+            char path[600];
+            path_of(path, "vbr_case.mp3");
+            write_file(path, mp3.p, mp3.len);
+            pcm mine = {0}, ref = {0};
+            decode_all(mp3.p, mp3.len, &mine, NULL);
+            CHECK(ffmpeg_decode(path, &ref) && mine.len == ref.len && max_diff(&ref, &mine, 0, ref.len) < 1e-4,
+                  "VBR %d Hz: ffmpeg decodes it differently", cases[c].rate);
+            free(mine.p);
+            free(ref.p);
+        }
+    }
+    g_round_trip_vbr = 0;
+
+    /* Settings that make no sense are refused. */
+    ahmp3_encoder_config bad1 = {44100, 2, 0, AHMP3_JOINT_STEREO, 0}, bad2 = {44100, 2, 128, AHMP3_JOINT_STEREO, 11},
+                         bad3 = {44100, 2, 100, AHMP3_JOINT_STEREO, 5};
+    CHECK(!ahmp3_encoder_new(&bad1) && !ahmp3_encoder_new(&bad2) && !ahmp3_encoder_new(&bad3), "bad encoder settings were accepted");
+    free(mp3.p);
+}
+
+/* The info frame the encoder writes: players that read it (ffmpeg here) give
+   back exactly as many samples as went in, lined up with the input. */
+static void test_info_frame(void)
+{
+    static const struct {
+        int rate, channels, kbps, vbr;
+        size_t frames;
+    } cases[] = {
+        {44100, 2, 128, 0, 100000}, {48000, 2, 320, 0, 48000 * 2 + 1}, {44100, 1, 64, 0, 1},  {32000, 2, 32, 0, 77777},
+        {22050, 2, 64, 0, 50001},   {8000, 1, 8, 0, 20000},            {11025, 2, 16, 0, 1152}, {44100, 2, 128, 0, 1151},
+        {44100, 2, 0, 10, 100003},  {44100, 2, 0, 5, 99999},           {16000, 1, 0, 7, 40000}, {48000, 2, 0, 1, 96000},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        int rate = cases[c].rate, ch = cases[c].channels;
+        size_t frames = cases[c].frames;
+        float *x = malloc(frames * (size_t)ch * sizeof(float));
+        signal(x, frames, ch, rate, 0);
+        ahmp3_encoder_config cfg = {rate, ch, cases[c].kbps, ch == 1 ? AHMP3_MONO : AHMP3_JOINT_STEREO, cases[c].vbr};
+        ahmp3_encoder *e = ahmp3_encoder_new(&cfg);
+        CHECK(e != NULL, "info frame case %zu: encoder refused the settings", c);
+        if (!e) { free(x); continue; }
+        unsigned char first[AHMP3_ENCODE_BOUND(0)], last[AHMP3_ENCODE_BOUND(0)];
+        unsigned char *buf = malloc(AHMP3_ENCODE_BOUND(frames));
+        size_t first_len = ahmp3_encoder_info_frame(e, first, sizeof(first));
+        size_t n = ahmp3_encode(e, x, frames, buf, AHMP3_ENCODE_BOUND(frames));
+        n += ahmp3_encoder_flush(e, buf + n, AHMP3_ENCODE_BOUND(frames) - n);
+        size_t last_len = ahmp3_encoder_info_frame(e, last, sizeof(last));
+        CHECK(first_len > 0 && first_len == last_len, "info frame case %zu: its size changed (%zu, %zu)", c, first_len, last_len);
+        CHECK(ahmp3_encoder_info_frame(e, last, last_len - 1) == 0, "info frame case %zu: written into too little room", c);
+        ahmp3_encoder_free(e);
+
+        bytes mp3 = {0};
+        bytes_put(&mp3, last, last_len);
+        bytes_put(&mp3, buf, n);
+        pcm mine = {0};
+        ahmp3_info info;
+        decode_all(mp3.p, mp3.len, &mine, &info);
+        size_t count = 0, at = last_len;
+        while (at + 4 <= mp3.len) {
+            ahmp3_frame fr;
+            if (!ahmp3_parse_header(mp3.p + at, mp3.len - at, &fr) || !fr.frame_bytes) break;
+            at += (size_t)fr.frame_bytes;
+            count++;
+        }
+        CHECK(info.present && info.frames == count && info.bytes == mp3.len && info.encoder_delay == 528,
+              "info frame case %zu: says %u frames, %u bytes, delay %d; the file has %zu frames, %zu bytes", c, info.frames,
+              info.bytes, info.encoder_delay, count, mp3.len);
+        /* Trimmed by the tag, the sound is the input's length and lines up
+           with it sample for sample. */
+        size_t skip = (size_t)(info.encoder_delay + AHMP3_DECODER_DELAY) * (size_t)ch;
+        size_t cut = info.encoder_padding >= AHMP3_DECODER_DELAY ? (size_t)(info.encoder_padding - AHMP3_DECODER_DELAY) * (size_t)ch : 0;
+        size_t len = mine.len > skip + cut ? mine.len - skip - cut : 0;
+        CHECK(info.encoder_padding >= AHMP3_DECODER_DELAY && len == frames * (size_t)ch,
+              "info frame case %zu: trimmed length %zu, input %zu (padding %d)", c, len / (size_t)ch, frames, info.encoder_padding);
+        if (len == frames * (size_t)ch && frames > 5000) {
+            double sig = 0, noise = 0;
+            for (size_t i = 0; i < len; i++) {
+                double a = x[i], b = mine.p[skip + i];
+                sig += a * a;
+                noise += (a - b) * (a - b);
+            }
+            CHECK(10 * log10(sig / (noise + 1e-30)) > 9, "info frame case %zu: trimmed sound is not lined up with the input (%.1f dB)", c,
+                  10 * log10(sig / (noise + 1e-30)));
+        }
+        if (g_ffmpeg) {
+            char name[64], path[600];
+            snprintf(name, sizeof(name), "info_%zu.mp3", c);
+            path_of(path, name);
+            write_file(path, mp3.p, mp3.len);
+            bytes ref = {0};
+            CHECK(ffmpeg_raw(path, NULL, "f32le", &ref), "%s: ffmpeg could not decode it", name);
+            pcm r = {0}, trimmed = {0};
+            pcm_put(&r, (const float *)ref.p, ref.len / 4);
+            pcm_put(&trimmed, mine.p + (skip < mine.len ? skip : mine.len), len);
+            CHECK(r.len == frames * (size_t)ch, "%s: ffmpeg plays %zu samples, the input had %zu", name, r.len / (size_t)ch, frames);
+            CHECK(r.len == trimmed.len && max_diff(&r, &trimmed, 0, r.len) < 1e-4, "%s: ffmpeg's gapless output differs from the tag-trimmed sound", name);
+            free(ref.p);
+            free(r.p);
+            free(trimmed.p);
+        }
+        free(mp3.p);
+        free(mine.p);
+        free(buf);
+        free(x);
+    }
 }
 
 /* Bad input and a caller with no room for output: no crash, a clean stream. */
@@ -886,6 +1188,13 @@ int main(int argc, char **argv)
     test_tables();
     printf("encoder\n");
     test_encoder();
+    printf("CRC and free format\n");
+    test_crc();
+    test_free_format();
+    printf("variable bit rate\n");
+    test_vbr();
+    printf("info frame and gapless playback of the encoder's own files\n");
+    test_info_frame();
     printf("damaged input\n");
     test_damage();
     test_encoder_hostile();
@@ -917,6 +1226,14 @@ int main(int argc, char **argv)
     } else {
         printf("ffmpeg not found: the checks against it were skipped\n");
     }
+    printf("Layers I and II\n");
+    test_layers();
+    printf("WAV\n");
+    test_wav();
+    printf("FLAC\n");
+    test_flac();
+    printf("AAC\n");
+    test_aac();
     printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

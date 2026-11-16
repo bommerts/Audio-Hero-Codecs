@@ -23,11 +23,13 @@ typedef struct {
 
 typedef struct {
     int lsf, sr_index, bitrate_index, padding, mode, mode_ext, channels, granules;
+    int crc;               /* write a CRC after the header */
     int main_data_begin;
     ahmp3_gr gr[2][2];
 } ahmp3_fr;
 
-/* Header plus side information; returns its bytes. */
+/* Header (with its CRC when asked for) plus side information; returns its
+   bytes. */
 int ahmp3_write_header(const ahmp3_fr *f, unsigned char *out);
 /* Scale factors and Huffman data of every granule; returns bits written. */
 int ahmp3_write_main(const ahmp3_fr *f, unsigned char *out, int cap);

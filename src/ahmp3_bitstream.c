@@ -399,7 +399,7 @@ int ahmp3_write_header(const ahmp3_fr *f, unsigned char *out)
     put(&w, 0x7FF, 11);
     put(&w, (unsigned)version, 2);
     put(&w, 1, 2); /* Layer III */
-    put(&w, 1, 1); /* no CRC */
+    put(&w, f->crc ? 0 : 1, 1);
     put(&w, (unsigned)f->bitrate_index, 4);
     put(&w, (unsigned)(f->sr_index % 3), 2);
     put(&w, (unsigned)f->padding, 1);
@@ -409,6 +409,7 @@ int ahmp3_write_header(const ahmp3_fr *f, unsigned char *out)
     put(&w, 0, 1); /* copyright */
     put(&w, 1, 1); /* original */
     put(&w, 0, 2); /* emphasis */
+    if (f->crc) put(&w, 0, 16); /* filled in below */
 
     int nch = f->channels;
     if (f->lsf) {
@@ -441,6 +442,12 @@ int ahmp3_write_header(const ahmp3_fr *f, unsigned char *out)
             put(&w, (unsigned)G->scalefac_scale, 1);
             put(&w, (unsigned)G->count1_table, 1);
         }
+    }
+    if (f->crc) {
+        unsigned crc = ahmp3_crc16(0xFFFF, out + 2, 16);
+        crc = ahmp3_crc16(crc, out + 6, (size_t)w.bits - 48);
+        out[4] = (unsigned char)(crc >> 8);
+        out[5] = (unsigned char)crc;
     }
     return w.bits / 8;
 }
