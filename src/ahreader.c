@@ -2,6 +2,7 @@
    at a time, trims gapless files, and seeks. */
 #include "../include/ahreader.h"
 #include "../include/ahaac.h"
+#include "../include/ahalac.h"
 #include "../include/ahflac.h"
 #include "../include/ahm4a.h"
 #include "../include/ahmp3.h"
@@ -43,11 +44,13 @@ struct ahreader {
     ahaac_decoder *aac;
     ahflac_decoder *flac;
     ahwav_decoder *wav;
+    ahalac_decoder *alac;
     ahm4a *m4a;
-    int32_t *ints;       /* FLAC's whole numbers */
+    int32_t *ints;       /* FLAC's and ALAC's whole numbers */
     uint8_t *packet;     /* one M4A packet */
     size_t packet_cap;
     uint64_t next_packet;
+    uint64_t packet_samples; /* M4A: per channel in a full packet */
     uint64_t play_total; /* M4A: samples to play in all */
 
     uint64_t first_frame; /* where the first frame of sound starts */
@@ -141,13 +144,24 @@ static bool decode_packet(ahreader *r)
 {
     const ahm4a_info *info = ahm4a_get_info(r->m4a);
     if (r->next_packet >= info->packets) return false;
-    float *at = r->pcm + r->pcm_len * (size_t)r->info.channels;
+    size_t channels = (size_t)r->info.channels, frame = (size_t)r->packet_samples;
+    float *at = r->pcm + r->pcm_len * channels;
     int n = 0;
-    ahaac_frame fr;
     size_t bytes = ahm4a_read_packet(r->m4a, r->next_packet++, r->packet, r->packet_cap);
+    if (r->alac) {
+        if (bytes && ahalac_decode_packet(r->alac, r->packet, bytes, r->ints, frame * channels, &n) && n) {
+            ahalac_to_float(r->ints, at, (size_t)n * channels, r->info.bits);
+            frame = (size_t)n;
+        } else {
+            memset(at, 0, frame * channels * sizeof(float));
+        }
+        append(r, frame);
+        return true;
+    }
+    ahaac_frame fr;
     if (!bytes || !ahaac_decode_packet(r->aac, r->packet, bytes, at, &n, &fr) || !n || fr.channels != r->info.channels
         || fr.sample_rate != r->info.sample_rate)
-        memset(at, 0, (size_t)AHAAC_MAX_SAMPLES * (size_t)r->info.channels * sizeof(float));
+        memset(at, 0, (size_t)AHAAC_MAX_SAMPLES * channels * sizeof(float));
     append(r, AHAAC_MAX_SAMPLES);
     return true;
 }
@@ -252,12 +266,61 @@ static size_t m4a_read(void *user, uint64_t offset, void *buffer, size_t bytes)
     return read_at(r, r->base + offset, buffer, bytes);
 }
 
+/* Apple Lossless in an M4A file: every packet stands alone, and the
+   settings say all there is to know. */
+static const char *open_alac(ahreader *r)
+{
+    const ahm4a_info *info = ahm4a_get_info(r->m4a);
+    ahalac_format f;
+    r->alac = ahalac_decoder_new();
+    if (!r->alac) return "out of memory";
+    if (!ahalac_decoder_configure(r->alac, info->config, info->config_bytes, &f)) return ahalac_decoder_error(r->alac);
+    size_t frame = (size_t)f.frame_samples, channels = (size_t)f.channels;
+    /* The biggest packet an encoder makes is the samples as they are, plus
+       a few bytes; a bigger one, which only a damaged index claims, plays
+       as silence. */
+    uint64_t biggest = (uint64_t)frame * channels * 5 + 64 * channels + 64;
+    r->packet_cap = (size_t)((uint64_t)info->max_packet_bytes < biggest ? (uint64_t)info->max_packet_bytes : biggest) + 1;
+    r->packet = malloc(r->packet_cap);
+    r->ints = malloc(frame * channels * sizeof(int32_t));
+    r->pcm_cap = 2 * frame;
+    r->pcm = malloc(r->pcm_cap * channels * sizeof(float));
+    if (!r->packet || !r->ints || !r->pcm) return "out of memory";
+    /* A file whose first packets do not decode holds no sound to speak of. */
+    int n = 0;
+    for (uint64_t i = 0; i < info->packets && i < 16 && !n; i++) {
+        size_t bytes = ahm4a_read_packet(r->m4a, i, r->packet, r->packet_cap);
+        if (bytes) ahalac_decode_packet(r->alac, r->packet, bytes, r->ints, frame * channels, &n);
+    }
+    if (!n) return "the M4A file holds no sound that could be decoded";
+    r->info.kind = AHREADER_ALAC;
+    r->info.name = "ALAC";
+    r->info.sample_rate = f.sample_rate;
+    r->info.channels = f.channels;
+    r->info.channel_mask = f.channel_mask;
+    r->info.bits = f.bits;
+    r->packet_samples = frame;
+    uint64_t delay = info->delay, samples = info->samples, decoded = info->packets * frame;
+    if (info->timescale > 0 && info->timescale != (uint32_t)f.sample_rate) {
+        delay = delay * (uint64_t)f.sample_rate / info->timescale;
+        samples = samples * (uint64_t)f.sample_rate / info->timescale;
+    }
+    if (delay > decoded) delay = decoded;
+    if (!samples || samples > decoded - delay) samples = decoded - delay;
+    r->lead = r->skip = delay;
+    r->play_total = r->left = samples;
+    r->info.samples = samples;
+    r->info.samples_exact = true;
+    return NULL;
+}
+
 static const char *open_m4a(ahreader *r)
 {
     const char *error = NULL;
     r->m4a = ahm4a_open(m4a_read, r, r->size - r->base, &error);
     if (!r->m4a) return error ? error : "not an M4A file that can be read";
     const ahm4a_info *info = ahm4a_get_info(r->m4a);
+    if (info->codec == AHM4A_ALAC) return open_alac(r);
     r->aac = ahaac_decoder_new();
     /* No real AAC packet comes near this; a bigger one, which only a
        damaged index claims, plays as silence. */
@@ -289,6 +352,7 @@ static const char *open_m4a(ahreader *r)
     if (!r->aac || !ahaac_decoder_configure(r->aac, info->config, info->config_bytes)) return "out of memory";
     r->info.kind = AHREADER_M4A;
     r->info.name = "M4A";
+    r->packet_samples = AHAAC_MAX_SAMPLES;
     r->info.sample_rate = fr.sample_rate;
     r->info.channels = fr.channels;
     r->info.half_rate = fr.sbr;
@@ -528,6 +592,7 @@ void ahreader_close(ahreader *r)
     ahaac_decoder_free(r->aac);
     ahflac_decoder_free(r->flac);
     ahwav_decoder_free(r->wav);
+    ahalac_decoder_free(r->alac);
     ahm4a_close(r->m4a);
     free(r->in);
     free(r->pcm);
@@ -642,11 +707,13 @@ bool ahreader_seek(ahreader *r, uint64_t sample)
         set_window(r, r->base + at);
         if (r->info.samples) r->left = r->info.samples - sample;
     } else if (r->m4a) {
-        /* A packet needs the one before it; start two back to be sure. */
-        uint64_t at = sample + r->lead, packet = at / AHAAC_MAX_SAMPLES, first = packet > 2 ? packet - 2 : 0;
-        ahaac_decoder_reset(r->aac);
+        /* An AAC packet needs the one before it; start two back to be
+           sure. An ALAC packet stands alone. */
+        uint64_t at = sample + r->lead, packet = at / r->packet_samples, back = r->aac ? 2 : 0;
+        uint64_t first = packet > back ? packet - back : 0;
+        if (r->aac) ahaac_decoder_reset(r->aac);
         r->next_packet = first;
-        r->skip = at - first * AHAAC_MAX_SAMPLES;
+        r->skip = at - first * r->packet_samples;
         r->left = r->play_total - sample;
     } else if (r->flac) {
         flac_seek(r, sample);

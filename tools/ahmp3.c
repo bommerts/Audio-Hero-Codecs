@@ -1,10 +1,10 @@
 /* Command line tool.
      ahmp3 decode <in> <out.wav> [--raw-float]
      ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono] [--rate 44100]
-   <in> is an MP3 (or MPEG Layer I or II), WAV, FLAC, AAC (ADTS) or M4A file;
-   its kind is told from its contents. Encoding mixes more than two channels
-   down to stereo and changes the sample rate when MP3 has no such rate, or
-   when --rate asks. */
+   <in> is an MP3 (or MPEG Layer I or II), WAV, FLAC, AAC (ADTS) or M4A (AAC
+   or Apple Lossless) file; its kind is told from its contents. Encoding
+   mixes more than two channels down to stereo and changes the sample rate
+   when MP3 has no such rate, or when --rate asks. */
 #include "../include/ahmix.h"
 #include "../include/ahmp3.h"
 #include "../include/ahreader.h"
@@ -268,6 +268,6 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "usage: ahmp3 decode <in> <out.wav> [--raw-float]\n"
                     "       ahmp3 encode <in> <out.mp3> [--bitrate 128] [--vbr 1..10] [--stereo | --mono] [--rate 44100]\n"
-                    "<in> is an MP3, WAV, FLAC, AAC or M4A file.\n");
+                    "<in> is an MP3, WAV, FLAC, AAC or M4A (AAC or Apple Lossless) file.\n");
     return 2;
 }

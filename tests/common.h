@@ -66,6 +66,7 @@ void test_wav(void);
 void test_flac(void);
 void test_layers(void);
 void test_aac(void);
+void test_alac(void);
 void test_convert(void);
 void test_reader(void);
 

@@ -224,5 +224,7 @@ void test_reader(void)
     check_file("reader_float.wav", "-ar 8000 -c:a pcm_f32le", NULL, AHREADER_WAV, true, true);
     check_file("reader_6ch.wav", "-ac 6 -c:a pcm_s16le", NULL, AHREADER_WAV, true, true);
     check_file("reader_6ch.flac", "-ac 6 -c:a flac", NULL, AHREADER_FLAC, true, true);
-    check_refused("reader_alac.m4a", "-c:a alac", "Apple Lossless");
+    check_file("reader_alac.m4a", "-c:a alac", NULL, AHREADER_ALAC, true, true);
+    check_file("reader_alac_24_6ch.m4a", "-ac 6 -c:a alac -sample_fmt s32p", NULL, AHREADER_ALAC, true, true);
+    check_refused("reader_fragmented.mp4", "-c:a aac -movflags frag_keyframe+empty_moov -f mp4", "fragmented");
 }

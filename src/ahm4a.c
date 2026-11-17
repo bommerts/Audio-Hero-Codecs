@@ -1,6 +1,6 @@
-/* MP4 reader for AAC sound tracks, following ISO/IEC 14496-12 (the file
-   format's boxes and sample tables) and 14496-14 (the esds box that holds
-   the decoder settings). The moov box, which is the file's index, is read
+/* MP4 reader for AAC and Apple Lossless sound tracks, following ISO/IEC
+   14496-12 (the file format's boxes and sample tables) and 14496-14 (the
+   esds box that holds AAC's decoder settings). The moov box, which is the file's index, is read
    whole; the sound itself is left where it is. */
 #include "../include/ahm4a.h"
 #include <stdlib.h>
@@ -115,15 +115,34 @@ static const char *read_esds(span esds, ahm4a *m)
     return NULL;
 }
 
-/* The sound description: an mp4a entry whose esds box describes AAC. */
+/* Apple Lossless settings: an 'alac' box holding a version and the 24-byte
+   ALACSpecificConfig, which gives the channels and the sample rate. */
+static const char *read_alac(span box, ahm4a *m)
+{
+    if (box.len < 4 + 24) return "damaged Apple Lossless settings";
+    const uint8_t *c = box.p + 4;
+    uint32_t frame = be32(c), rate = be32(c + 20);
+    if (!frame || !c[9] || !rate || rate > 0x7FFFFFFF) return "damaged Apple Lossless settings";
+    memcpy(m->config, c, 24);
+    m->info.config = m->config;
+    m->info.config_bytes = 24;
+    m->info.codec = AHM4A_ALAC;
+    m->info.packet_samples = frame;
+    m->info.channels = c[9];
+    m->info.sample_rate = (int)rate;
+    return NULL;
+}
+
+/* The sound description: an mp4a entry whose esds box describes AAC, or an
+   alac entry. */
 static const char *read_description(span stsd, ahm4a *m)
 {
     if (stsd.len < 8) return "damaged MP4 sound description";
-    span entries = {stsd.p + 8, stsd.len - 8}, entry, esds, wave;
+    span entries = {stsd.p + 8, stsd.len - 8}, entry, esds, wave, alac;
     const uint8_t *type;
     if (!next_box(&entries, &type, &entry)) return "damaged MP4 sound description";
-    if (!memcmp(type, "alac", 4)) return "Apple Lossless (ALAC) is not supported";
-    if (memcmp(type, "mp4a", 4) || entry.len < 28) return "the MP4 file's sound is not AAC";
+    bool lossless = !memcmp(type, "alac", 4);
+    if ((!lossless && memcmp(type, "mp4a", 4)) || entry.len < 28) return "the MP4 file's sound is neither AAC nor Apple Lossless";
     m->info.channels = (int)be16(entry.p + 16);
     m->info.sample_rate = (int)be16(entry.p + 24);
     /* QuickTime's later versions of the entry are longer. */
@@ -141,6 +160,13 @@ static const char *read_description(span stsd, ahm4a *m)
         m->info.channels = channels <= 64 ? (int)channels : 0;
     }
     span inside = {entry.p + fixed, entry.len - fixed};
+    if (lossless) {
+        if (find_box(inside, "alac", &alac)) return read_alac(alac, m);
+        if (find_box(inside, "wave", &wave) && find_box(wave, "alac", &alac)) return read_alac(alac, m);
+        return "damaged Apple Lossless settings";
+    }
+    m->info.codec = AHM4A_AAC;
+    m->info.packet_samples = 1024;
     if (find_box(inside, "esds", &esds)) return read_esds(esds, m);
     if (find_box(inside, "wave", &wave) && find_box(wave, "esds", &esds)) return read_esds(esds, m);
     return "damaged MP4 sound description";
@@ -149,7 +175,7 @@ static const char *read_description(span stsd, ahm4a *m)
 /* Works out where every packet lies from the sample tables: the size of
    each (stsz), how many each chunk holds (stsc) and where chunks start
    (stco or co64). */
-static const char *read_tables(span stbl, ahm4a *m, uint64_t *duration)
+static const char *read_tables(span stbl, ahm4a *m, uint64_t *duration, uint64_t *last)
 {
     span stsz, stsc, stco, stts;
     bool wide = false;
@@ -191,11 +217,15 @@ static const char *read_tables(span stbl, ahm4a *m, uint64_t *duration)
     m->info.max_packet_bytes = (int)(biggest > 0x7FFFFFFF ? 0x7FFFFFFF : biggest);
 
     /* The playing time of the packets together, in samples. */
-    *duration = 0;
+    *duration = *last = 0;
     if (find_box(stbl, "stts", &stts) && stts.len >= 8) {
         uint32_t entries = be32(stts.p + 4);
         if ((stts.len - 8) / 8 < entries) entries = (uint32_t)((stts.len - 8) / 8);
-        for (uint32_t i = 0; i < entries; i++) *duration += (uint64_t)be32(stts.p + 8 + 8 * (size_t)i) * be32(stts.p + 12 + 8 * (size_t)i);
+        for (uint32_t i = 0; i < entries; i++) {
+            uint32_t times = be32(stts.p + 8 + 8 * (size_t)i), each = be32(stts.p + 12 + 8 * (size_t)i);
+            *duration += (uint64_t)times * each;
+            if (times) *last = each;
+        }
     }
     return NULL;
 }
@@ -259,13 +289,18 @@ static const char *read_index(span moov, ahm4a *m)
         if (!find_box(mdia, "hdlr", &hdlr) || hdlr.len < 12 || memcmp(hdlr.p + 8, "soun", 4)) continue;
         if (!find_box(mdia, "minf", &minf) || !find_box(minf, "stbl", &stbl) || !find_box(stbl, "stsd", &stsd)) continue;
         problem = read_description(stsd, m);
-        if (problem) continue; /* another track may be the AAC one */
-        uint64_t duration = 0;
-        problem = read_tables(stbl, m, &duration);
+        if (problem) continue; /* another track may be the one */
+        uint64_t duration = 0, last = 0;
+        problem = read_tables(stbl, m, &duration, &last);
         if (problem) return problem;
 
         uint32_t media_scale = 0;
-        if (find_box(mdia, "mdhd", &mdhd) && mdhd.len >= 24) media_scale = be32(mdhd.p + (mdhd.p[0] == 1 ? 20 : 12));
+        uint64_t media_length = 0;
+        if (find_box(mdia, "mdhd", &mdhd) && mdhd.len >= 24) {
+            bool wide = mdhd.p[0] == 1;
+            media_scale = be32(mdhd.p + (wide ? 20 : 12));
+            media_length = wide ? (mdhd.len >= 32 ? be64(mdhd.p + 24) : 0) : be32(mdhd.p + 16);
+        }
         m->info.timescale = media_scale ? media_scale : m->info.sample_rate > 0 ? (uint32_t)m->info.sample_rate : 0;
         /* The edit list: the first entry that plays something says where
            in the track the music starts and how long it runs. */
@@ -293,7 +328,13 @@ static const char *read_index(span moov, ahm4a *m)
             }
         }
         if (!m->info.delay && !m->info.samples) read_itunes_gapless(moov, m);
-        if (!m->info.samples) m->info.samples = duration > m->info.delay ? duration - m->info.delay : 0;
+        if (!m->info.samples) {
+            /* Neither says how long: the track's own length does, when it
+               ends inside the last packet (some encoders round the last
+               packet up to a whole one, and ffmpeg cuts it there too). */
+            if (media_length < duration && media_length > duration - last) duration = media_length;
+            m->info.samples = duration > m->info.delay ? duration - m->info.delay : 0;
+        }
         return NULL;
     }
     return problem;

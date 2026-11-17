@@ -4,7 +4,8 @@ Audio decoders, an MP3 encoder, a sample rate converter and a mix to stereo
 in plain C, written from the published standards with no dependencies beyond
 the C standard library. They were built for the Audio Hero Companion, which
 streams music to network audio devices, and are published here for anyone to
-use.
+use. [EXCEPTIONS.md](EXCEPTIONS.md) lists the formats with no published
+standard to follow.
 
 | Format | Decode | Encode | Header |
 | --- | --- | --- | --- |
@@ -12,6 +13,7 @@ use.
 | MPEG Layers I and II (.mp1, .mp2) | yes | | `ahmp3.h` |
 | FLAC | yes | | `ahflac.h` |
 | AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
+| Apple Lossless (ALAC), in MP4 (.m4a) | yes | | `ahalac.h`, `ahm4a.h` |
 | WAV | yes | | `ahwav.h` |
 
 Around them:
@@ -65,8 +67,8 @@ to the old name still work.
 - AAC-LC (low complexity, the kind music files use), mono and stereo, all 13
   sample rates from 7.35 to 96 kHz
 - ADTS streams, and MP4/M4A files through a small reader that finds the
-  track, its settings, each packet, and the gapless trim (edit list or
-  iTunes tag)
+  track, its settings, each packet, and the gapless trim (edit list,
+  iTunes tag, or the track's own stated length)
 - All of AAC-LC: every code book, pulses, mid/side and intensity stereo,
   perceptual noise substitution, temporal noise shaping, long and short
   windows of both shapes
@@ -74,7 +76,19 @@ to the old name still work.
   Such a file still plays, as the plain AAC inside it: at half the sample
   rate, without the top of the treble. The decoder says when that happens.
 - Refused with a reason: AAC Main, SSR and LTP, 960-sample frames, more than
-  two channels, Apple Lossless (ALAC), fragmented MP4
+  two channels, fragmented MP4
+
+**Apple Lossless (ALAC) decoder**
+- 16, 20, 24 and 32 bits, 1 to 8 channels, every sample rate, from M4A
+  files through the same MP4 reader as AAC
+- All of the format: samples sent as they are or predicted, the adaptive
+  predictor in both of its modes, the adaptive Golomb code with its escapes
+  and runs of zeros, mixed stereo pairs, low bytes sent apart, a short last
+  packet, and the data and fill elements a packet may carry
+- Apple's channel layout for each count, given out in WAV order with a
+  channel mask
+- Every packet stands alone, so a seek is exact and costs nothing
+- Output as whole numbers, exactly as encoded, with a helper for floats
 
 **WAV reader**
 - RIFF/WAVE and RF64, plain and extensible headers
@@ -107,21 +121,23 @@ to the old name still work.
 
 ## How it is checked
 
-`tests/` runs about 3,700 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 4,100 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
   written into a frame and decoded by both decoders; the output must match.
 - **Random frames using every feature.** Small frame writers in the tests
-  build thousands of MP3, Layer I, Layer II, AAC and FLAC frames at random
-  that use every part of each format, well beyond what encoders choose to
-  write. This decoder and ffmpeg must agree: to floating point precision for
-  the lossy formats, bit for bit for FLAC. For FLAC the test also knows the
-  samples it encoded, so the decoder is checked without ffmpeg too.
-- **Files from other encoders.** LAME, shine, twolame, ffmpeg's own MP2, AAC
-  and FLAC encoders and the Windows Media Foundation MP3 and AAC encoders:
-  every file must decode exactly as ffmpeg decodes it. WAV files of every
-  sample format must read bit for bit as ffmpeg reads them.
+  build thousands of MP3, Layer I, Layer II, AAC, FLAC and ALAC frames at
+  random that use every part of each format, well beyond what encoders
+  choose to write. This decoder and ffmpeg must agree: to floating point
+  precision for the lossy formats, bit for bit for FLAC and ALAC. For FLAC
+  and ALAC the test also knows the samples it encoded, so the decoder is
+  checked without ffmpeg too, including the parts of ALAC that ffmpeg reads
+  differently (below).
+- **Files from other encoders.** LAME, shine, twolame, ffmpeg's own MP2,
+  AAC, FLAC and ALAC encoders and the Windows Media Foundation MP3 and AAC
+  encoders: every file must decode exactly as ffmpeg decodes it. WAV files
+  of every sample format must read bit for bit as ffmpeg reads them.
 - **This encoder's output** must decode the same in ffmpeg as here, with no
   errors, for constant and variable bit rate, including input full of NaN,
   infinity and clipping.
@@ -131,8 +147,8 @@ ffmpeg as an independent reference:
 - **The reader.** Files of every kind must come out as ffmpeg decodes them,
   to the same length; the length the reader states must be the length it
   gives; and a seek to any sample must give what a read from the start
-  gives there (exactly for FLAC and WAV, to floating point precision for
-  the rest).
+  gives there (exactly for FLAC, ALAC and WAV, to floating point precision
+  for the rest).
 - **Sample rate conversion against the mathematics.** A tone resampled is
   the same tone at the new rate. For 18 pairs of rates, tones across the
   kept band must come out within 94 dB of that ideal (a level error under
@@ -176,6 +192,21 @@ rate.
 - **AAC after a damaged frame.** ffmpeg carries on with what the frame
   before the bad one left behind; this decoder starts the next frame from
   silence.
+- **ALAC corners no encoder uses.** ALAC has no standard but the decoder
+  Apple published, and ffmpeg reads a few rare things otherwise: prediction
+  modes 1 to 14 (Apple's decoder runs its extra first stage for every mode
+  but 0, ffmpeg only for 15), mix weights over 127 (Apple reads the byte as
+  signed), data and fill elements (Apple skips them, ffmpeg refuses the
+  packet), a 32-bit pair sent as it is with no low bytes apart (ffmpeg
+  refuses it), single channels and pairs in an order other than the usual
+  one for the channel count (Apple places them in turn; ffmpeg puts a pair
+  at its first channel's place and the next), and three cases in the
+  Golomb code (a value of 65,535 right after a run of zeros, a running
+  mean of 0 when a run follows, and a limit on the code's parameter below
+  8). This decoder follows Apple's (see [EXCEPTIONS.md](EXCEPTIONS.md)).
+  Damage is also met as Apple's decoder
+  meets it: a run of zeros longer than the packet, or 24 low bits sent
+  apart, makes the packet play as silence, where ffmpeg plays on.
 - **Mono to stereo.** ffmpeg plays a one-channel file 3 dB down on each
   side. The mix here puts it on both sides as it is, so a mono file is no
   quieter than a stereo one.
@@ -204,6 +235,7 @@ On one core of a desktop PC:
 | Layer II decode | 800 |
 | AAC decode | 650 |
 | FLAC decode (16-bit, 44.1 kHz) | 1000 |
+| ALAC decode (16-bit, 44.1 kHz) | 500 |
 | MP3 encode | 50 to 100 |
 | Sample rate conversion, 48 to 44.1 kHz stereo | 500 |
 
@@ -262,7 +294,10 @@ for (uint64_t i = 0; i < info->packets; i++) {
     size_t bytes = ahm4a_read_packet(m, i, packet, sizeof(packet));
     ahaac_decode_packet(d, packet, bytes, pcm, &samples, &frame);
 }
-/* info->delay and info->samples say what to keep for gapless playback. */
+/* info->delay and info->samples say what to keep for gapless playback.
+   When info->codec is AHM4A_ALAC the packets are Apple Lossless:
+   ahalac_decoder_configure and ahalac_decode_packet (ahalac.h) take the
+   same places. */
 ```
 
 Or let the reader pick the decoder, and bring whatever the file holds to
@@ -294,7 +329,8 @@ ahreader_seek(r, 30 * (uint64_t)info->sample_rate); /* to 0:30 */
 
 Each header documents its whole interface: [ahmp3.h](include/ahmp3.h),
 [ahflac.h](include/ahflac.h), [ahaac.h](include/ahaac.h),
-[ahm4a.h](include/ahm4a.h), [ahwav.h](include/ahwav.h),
+[ahalac.h](include/ahalac.h), [ahm4a.h](include/ahm4a.h),
+[ahwav.h](include/ahwav.h),
 [ahreader.h](include/ahreader.h), [ahresample.h](include/ahresample.h),
 [ahmix.h](include/ahmix.h).
 
@@ -330,6 +366,7 @@ take just the files you need:
 | MP3 encoding | `ahmp3_encode.c`, `ahmp3_bitstream.c`, `ahmp3_tables.c`, `ahmp3_huff.c` |
 | FLAC | `ahflac.c` |
 | AAC | `ahaac_decode.c`, `ahaac_tables.c` |
+| Apple Lossless | `ahalac.c` |
 | M4A | `ahm4a.c` |
 | WAV | `ahwav.c` |
 | The reader | `ahreader.c` and all of the decoders |
@@ -341,8 +378,10 @@ take just the files you need:
 - The length of an MP3 file that carries no length header is worked out
   from its size and bit rate, which is only right when the bit rate is
   constant. A seek in such a file is still exact.
-- HE-AAC (SBR and parametric stereo), AAC with more than two channels, and
-  Apple Lossless.
+- HE-AAC (SBR and parametric stereo), and AAC with more than two channels.
+- Apple Lossless packets of more than 65,536 samples. Encoders write 4,096;
+  ffmpeg reads up to about 16 million, but a decoder holding that much
+  would not be small.
 - FLAC inside Ogg; the MD5 check of a whole FLAC file.
 - The CRC that an ADTS frame may carry is not checked.
 
@@ -350,8 +389,9 @@ take just the files you need:
 
 MIT, see [LICENSE](LICENSE).
 
-On patents: the MP3 patents have expired, and FLAC and WAV were never
-covered by any. AAC-LC dates from 1997 and its own patents are widely held
-to have run out, but a patent pool still offers an AAC license that bundles
-it with the later HE-AAC additions, which this code leaves out. This is not
-legal advice; if you ship a product, check for yourself.
+On patents: the MP3 patents have expired, FLAC and WAV were never covered
+by any, and Apple published Apple Lossless as open source, free of
+royalties, in 2011. AAC-LC dates from 1997 and its own patents are widely
+held to have run out, but a patent pool still offers an AAC license that
+bundles it with the later HE-AAC additions, which this code leaves out.
+This is not legal advice; if you ship a product, check for yourself.

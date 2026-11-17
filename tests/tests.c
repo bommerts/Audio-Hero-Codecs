@@ -1178,6 +1178,7 @@ int main(int argc, char **argv)
             setvbuf(stdout, NULL, _IONBF, 0);
             if (!strcmp(argv[i + 1], "convert")) test_convert();
             if (!strcmp(argv[i + 1], "reader")) test_reader();
+            if (!strcmp(argv[i + 1], "alac")) test_alac();
             printf("%d checks, %d failed\n", g_checks, g_failures);
             return g_failures ? 1 : 0;
         }
@@ -1242,6 +1243,8 @@ int main(int argc, char **argv)
     test_flac();
     printf("AAC\n");
     test_aac();
+    printf("Apple Lossless\n");
+    test_alac();
     test_convert();
     printf("one reader for every kind of file\n");
     test_reader();

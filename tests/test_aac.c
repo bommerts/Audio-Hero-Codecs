@@ -726,7 +726,6 @@ static void test_m4a(void)
     static const struct {
         const char *name, *args, *why;
     } refused[] = {
-        {"refuse_alac.m4a", "-c:a alac", "Apple Lossless"},
         {"refuse_mp3.mp4", "-c:a libmp3lame -f mp4", "MP3"},
         {"refuse_fragmented.mp4", "-c:a aac -movflags frag_keyframe+empty_moov -f mp4", "fragmented"},
     };
@@ -781,6 +780,28 @@ static void test_m4a(void)
         const char *error = m4a_decode(&file, &out, &info);
         CHECK(!error && info.delay == 0x840 && info.samples == 0x12345 && out.len == (size_t)0x12345 * 2, "iTunes gapless tag: %s, delay %u, %llu samples",
               error ? error : "read", info.delay, (unsigned long long)info.samples);
+    }
+
+    /* With no edit list, a track whose header says it ends inside the last
+       packet stops there, as ffmpeg plays it. */
+    read_file(path, &file);
+    size_t mdhd = find_name(&file, "mdhd", moov);
+    if (moov && edts && mdhd && file.p[mdhd + 4] == 0) {
+        char cut_path[600];
+        size_t at = mdhd + 4 + 16;
+        uint32_t length = (uint32_t)file.p[at] << 24 | (uint32_t)file.p[at + 1] << 16 | (uint32_t)file.p[at + 2] << 8 | file.p[at + 3];
+        length -= 50;
+        for (int i = 0; i < 4; i++) file.p[at + (size_t)i] = (unsigned char)(length >> (24 - 8 * i));
+        memcpy(file.p + edts, "free", 4);
+        path_of(cut_path, "m4a_cut.m4a");
+        write_file(cut_path, file.p, file.len);
+        pcm ref = {0};
+        const char *error = m4a_decode(&file, &out, &info);
+        CHECK(!error && info.samples == length && out.len == (size_t)length * 2, "a track that ends inside its last packet: %s, %llu samples",
+              error ? error : "read", (unsigned long long)info.samples);
+        CHECK(ffmpeg_decode(cut_path, NULL, &ref) && ref.len == out.len && max_diff(&ref, &out, 0, ref.len) < 1e-4,
+              "a track that ends inside its last packet plays otherwise in ffmpeg (%zu samples, ffmpeg %zu)", out.len / 2, ref.len / 2);
+        free(ref.p);
     }
 
     /* Damage to the index: no crash, and every packet lies inside the file. */
