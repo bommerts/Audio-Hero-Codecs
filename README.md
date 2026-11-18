@@ -11,9 +11,10 @@ standard to follow.
 | --- | --- | --- | --- |
 | MP3 (MPEG-1/2/2.5 Layer III) | yes | yes | `ahmp3.h` |
 | MPEG Layers I and II (.mp1, .mp2) | yes | | `ahmp3.h` |
-| FLAC | yes | | `ahflac.h` |
+| FLAC, native (.flac) or in Ogg (.oga) | yes | | `ahflac.h`, `ahogg.h` |
 | AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
 | Apple Lossless (ALAC), in MP4 (.m4a) | yes | | `ahalac.h`, `ahm4a.h` |
+| Vorbis, in Ogg (.ogg) | yes | | `ahvorbis.h`, `ahogg.h` |
 | WAV | yes | | `ahwav.h` |
 
 Around them:
@@ -61,6 +62,7 @@ to the old name still work.
   sizes
 - Checks both CRCs of every frame and drops damaged frames; resyncs; can
   start in the middle of a file after a seek
+- Native FLAC files, and FLAC in Ogg through the same Ogg reader as Vorbis
 - Output as whole numbers, exactly as encoded, with a helper for floats
 
 **AAC decoder**
@@ -90,6 +92,26 @@ to the old name still work.
 - Every packet stands alone, so a seek is exact and costs nothing
 - Output as whole numbers, exactly as encoded, with a helper for floats
 
+**Vorbis decoder**
+- 1 to 8 channels, every sample rate, both block sizes from 64 to 8192
+- All of the format: both floor types (line segments, and the LSP filter
+  of encoders from before Vorbis 1.0), the three residue types, codebooks sparse,
+  ordered and of a single entry, both kinds of value table, any number of
+  modes, mappings, submaps and coupling steps
+- The channels given out in WAV order with a channel mask
+- A packet cut short is decoded as far as it goes, as the specification
+  says
+
+**Ogg reader**
+- Finds the first Vorbis or FLAC stream in an Ogg file, past any other
+  streams mixed in with it
+- Gathers packets across pages, checks every page's checksum, and leaves
+  out damaged pages and the packets they break
+- Says where the stream ends and finds where to start reading for a seek,
+  by halving the file and then walking its pages
+- Applies what the pages state: the start of the sound (an encoder's run-in
+  to drop) and its end
+
 **WAV reader**
 - RIFF/WAVE and RF64, plain and extensible headers
 - Whole-number samples of 8, 16, 24 and 32 bits; floats of 32 and 64 bits;
@@ -101,8 +123,8 @@ to the old name still work.
 - Tells the kind of file from its contents, not its name
 - Decodes a piece at a time through a read function you supply, so a file
   of any size plays in a small, fixed amount of memory
-- Drops the run-in and padding of gapless MP3 and M4A files, so each file
-  gives exactly its own sound
+- Drops the run-in and padding of gapless MP3, M4A and Ogg files, so each
+  file gives exactly its own sound
 - Says how long the file is, and seeks to the sample
 
 **Sample rate converter**
@@ -121,7 +143,7 @@ to the old name still work.
 
 ## How it is checked
 
-`tests/` runs about 4,100 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 9,300 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
@@ -134,9 +156,20 @@ ffmpeg as an independent reference:
   and ALAC the test also knows the samples it encoded, so the decoder is
   checked without ffmpeg too, including the parts of ALAC that ffmpeg reads
   differently (below).
-- **Files from other encoders.** LAME, shine, twolame, ffmpeg's own MP2,
-  AAC, FLAC and ALAC encoders and the Windows Media Foundation MP3 and AAC
-  encoders: every file must decode exactly as ffmpeg decodes it. WAV files
+- **Random Vorbis streams.** A Vorbis writer in the tests makes random
+  setups and packets that use every part of the format, cut into Ogg pages
+  of every size. Where a stream uses something ffmpeg does not read (below),
+  the writer also makes its twin: the same sound written with only what
+  ffmpeg reads (a type 2 value table as an equivalent type 1 table, for
+  instance). This decoder must give a stream and its twin exactly the same
+  sound, and ffmpeg must give the twin's to floating point precision. Floor
+  lines that run past the end of a block are checked against the
+  specification's steps followed to the letter.
+- **Files from other encoders.** LAME, shine, twolame, libvorbis, ffmpeg's
+  own MP2, AAC, FLAC and ALAC encoders and the Windows Media Foundation MP3
+  and AAC encoders: every file must decode exactly as ffmpeg decodes it.
+  Ogg files from ffmpeg are also cut into pages anew at random, and must
+  give the same sound. WAV files
   of every sample format must read bit for bit as ffmpeg reads them.
 - **This encoder's output** must decode the same in ffmpeg as here, with no
   errors, for constant and variable bit rate, including input full of NaN,
@@ -147,8 +180,9 @@ ffmpeg as an independent reference:
 - **The reader.** Files of every kind must come out as ffmpeg decodes them,
   to the same length; the length the reader states must be the length it
   gives; and a seek to any sample must give what a read from the start
-  gives there (exactly for FLAC, ALAC and WAV, to floating point precision
-  for the rest).
+  gives there (exactly for FLAC, ALAC, Vorbis and WAV, to floating point
+  precision for the rest). Ogg files are also checked with their pages cut
+  every way, down to a few bytes, and with other streams mixed in.
 - **Sample rate conversion against the mathematics.** A tone resampled is
   the same tone at the new rate. For 18 pairs of rates, tones across the
   kept band must come out within 94 dB of that ideal (a level error under
@@ -207,11 +241,45 @@ rate.
   Damage is also met as Apple's decoder
   meets it: a run of zeros longer than the packet, or 24 low bits sent
   apart, makes the packet play as silence, where ffmpeg plays on.
+- **Vorbis corners no encoder uses.** ffmpeg refuses a stream that uses a
+  type 2 value table, a type 1 floor wider than half a long block, or a
+  residue range that runs past the end of the vector or the wrong way
+  round (the specification limits the range to the vector); it refuses a
+  packet in which a book of one entry sends its one-bit codeword as 1 (the
+  specification's errata allow either bit). It numbers the entries of a
+  sparse book that has a value table as if the unused ones were not there,
+  which changes what such a book gives when it is read as a number. When
+  coupling steps share a channel, it passes on which channels need a
+  residue in the opposite order to the specification's. And where a floor
+  line runs past the end of a short block, it ends the line there, which
+  bends it, instead of drawing it whole and cutting it. A type 0 floor
+  that names a book it does not have makes the packet undecodable, the
+  specification says; ffmpeg uses the floor's first book. This decoder
+  follows the specification in all of these.
+- **Vorbis type 0 floors.** The specification gives the LSP floor as a
+  formula; ffmpeg works it out in single precision, this decoder in double,
+  so the two can part by up to about one part in a thousand of the loudest
+  sample. Only encoders from before Vorbis 1.0 (2002) wrote this floor type.
+- **Ogg Vorbis start.** When the first page of sound states a position
+  lower than its packets give, the specification says the samples before
+  it are to be dropped (an encoder's way to mark its run-in). ffmpeg plays
+  them; this decoder drops them.
+- **Ogg Vorbis end.** The last page's position cuts the last packet short.
+  ffmpeg works the cut out, but with some ways of laying the packets out
+  in pages it does not make it, and plays the whole packet. This decoder
+  always cuts where the page says. Files from libvorbis, laid out in pages
+  every way the tests try, were cut the same by both.
+- **Short Ogg Vorbis files.** When all of a stream's sound fits on one page,
+  as it does in a file of a second or so, ffmpeg counts the first packet,
+  which gives no sound, as if it did, and cuts that much too much from the
+  end: 128 samples from libvorbis's files. This decoder ends where the page
+  says, which gives back exactly as many samples as went into the encoder.
 - **Mono to stereo.** ffmpeg plays a one-channel file 3 dB down on each
   side. The mix here puts it on both sides as it is, so a mono file is no
   quieter than a stereo one.
 
-Encoders in common use write none of these, so files play the same in both.
+Apart from short Ogg Vorbis files, encoders in common use write none of
+these, so files play the same in both.
 
 One thing is the same on purpose: the noise that fills AAC's noise bands
 comes from the same simple generator and starting value that ffmpeg uses, so
@@ -236,6 +304,7 @@ On one core of a desktop PC:
 | AAC decode | 650 |
 | FLAC decode (16-bit, 44.1 kHz) | 1000 |
 | ALAC decode (16-bit, 44.1 kHz) | 500 |
+| Vorbis decode (44.1 kHz stereo, quality 5) | 600 |
 | MP3 encode | 50 to 100 |
 | Sample rate conversion, 48 to 44.1 kHz stereo | 500 |
 
@@ -300,6 +369,25 @@ for (uint64_t i = 0; i < info->packets; i++) {
    same places. */
 ```
 
+```c
+#include "ahogg.h"
+#include "ahvorbis.h"
+
+/* Ogg Vorbis: the Ogg reader finds the packets, the Vorbis decoder decodes
+   them. */
+ahogg *o = ahogg_open(my_read_function, my_file, file_size, &error);
+ahvorbis_decoder *d = ahvorbis_decoder_new();
+for (int i = 0; i < 3; i++) {
+    ahogg_header(o, i, &data, &bytes);
+    ahvorbis_decoder_header(d, data, bytes, &format);
+}
+float pcm[AHVORBIS_MAX_SAMPLES * AHVORBIS_MAX_CHANNELS];
+while (ahogg_packet(o, &data, &bytes, &granule))
+    ahvorbis_decode_packet(d, data, bytes, pcm, &samples);
+/* The pages' granule positions say where the sound starts and ends; the
+   reader below applies them, and seeks. */
+```
+
 Or let the reader pick the decoder, and bring whatever the file holds to
 44.1 kHz stereo:
 
@@ -330,6 +418,7 @@ ahreader_seek(r, 30 * (uint64_t)info->sample_rate); /* to 0:30 */
 Each header documents its whole interface: [ahmp3.h](include/ahmp3.h),
 [ahflac.h](include/ahflac.h), [ahaac.h](include/ahaac.h),
 [ahalac.h](include/ahalac.h), [ahm4a.h](include/ahm4a.h),
+[ahvorbis.h](include/ahvorbis.h), [ahogg.h](include/ahogg.h),
 [ahwav.h](include/ahwav.h),
 [ahreader.h](include/ahreader.h), [ahresample.h](include/ahresample.h),
 [ahmix.h](include/ahmix.h).
@@ -340,6 +429,7 @@ contents:
 ```
 ahmp3 decode in.flac out.wav
 ahmp3 encode in.m4a out.mp3 --bitrate 192
+ahmp3 decode in.ogg out.wav
 ahmp3 encode in.wav out.mp3 --vbr 8
 ahmp3 encode surround96k.flac out.mp3 --rate 44100
 ```
@@ -367,7 +457,9 @@ take just the files you need:
 | FLAC | `ahflac.c` |
 | AAC | `ahaac_decode.c`, `ahaac_tables.c` |
 | Apple Lossless | `ahalac.c` |
+| Vorbis | `ahvorbis.c` |
 | M4A | `ahm4a.c` |
+| Ogg | `ahogg.c` |
 | WAV | `ahwav.c` |
 | The reader | `ahreader.c` and all of the decoders |
 | Sample rate conversion | `ahresample.c` |
@@ -382,7 +474,13 @@ take just the files you need:
 - Apple Lossless packets of more than 65,536 samples. Encoders write 4,096;
   ffmpeg reads up to about 16 million, but a decoder holding that much
   would not be small.
-- FLAC inside Ogg; the MD5 check of a whole FLAC file.
+- The MD5 check of a whole FLAC file.
+- Chained Ogg files (one stream after another, as recordings of internet
+  radio often are) give only their first stream.
+- Opus, and the other codecs an Ogg file may hold (Speex, Theora video).
+- Vorbis with more than 8 channels, and Vorbis setups with more than a
+  million codebook entries or 4 million vector values in all (libvorbis's
+  setups use far fewer).
 - The CRC that an ADTS frame may carry is not checked.
 
 ## License
@@ -390,7 +488,8 @@ take just the files you need:
 MIT, see [LICENSE](LICENSE).
 
 On patents: the MP3 patents have expired, FLAC and WAV were never covered
-by any, and Apple published Apple Lossless as open source, free of
+by any, Xiph.Org published Ogg and Vorbis for anyone to use free of
+royalties, and Apple published Apple Lossless as open source, free of
 royalties, in 2011. AAC-LC dates from 1997 and its own patents are widely
 held to have run out, but a patent pool still offers an AAC license that
 bundles it with the later HE-AAC additions, which this code leaves out.

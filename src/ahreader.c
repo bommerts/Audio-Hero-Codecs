@@ -6,6 +6,8 @@
 #include "../include/ahflac.h"
 #include "../include/ahm4a.h"
 #include "../include/ahmp3.h"
+#include "../include/ahogg.h"
+#include "../include/ahvorbis.h"
 #include "../include/ahwav.h"
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +47,14 @@ struct ahreader {
     ahflac_decoder *flac;
     ahwav_decoder *wav;
     ahalac_decoder *alac;
+    ahvorbis_decoder *vorbis;
     ahm4a *m4a;
+    ahogg *ogg;
+    bool ogg_lost;      /* Ogg: after a seek, where the sound decoded lies is
+                           not known until a page states it */
+    int64_t ogg_first;  /* where the first sound decoded from the start lies */
+    int64_t ogg_start;  /* where the sound played starts */
+    int64_t ogg_target; /* where a seek is to land */
     int32_t *ints;       /* FLAC's and ALAC's whole numbers */
     uint8_t *packet;     /* one M4A packet */
     size_t packet_cap;
@@ -166,6 +175,45 @@ static bool decode_packet(ahreader *r)
     return true;
 }
 
+/* Decodes one FLAC frame that came as an Ogg packet. Returns the samples
+   per channel it gave, as floats at `at`. */
+static size_t ogg_flac_frame(ahreader *r, const uint8_t *data, size_t bytes, float *at)
+{
+    size_t channels = (size_t)r->info.channels, total = 0, pos = 0, cap = r->pcm_cap * channels;
+    for (;;) {
+        int n = 0;
+        size_t used = ahflac_decode(r->flac, data + pos, bytes - pos, true, r->ints + total * channels, cap - total * channels, &n, NULL);
+        pos += used;
+        total += (size_t)n;
+        if ((!used && !n) || total == r->pcm_cap) break;
+    }
+    ahflac_to_float(r->ints, at, total * channels, r->info.bits);
+    return total;
+}
+
+/* Decodes the next packet of an Ogg file. After a seek the place of the
+   sound is not known until a page states it; what comes before goes. */
+static bool decode_ogg(ahreader *r)
+{
+    const uint8_t *data;
+    size_t bytes;
+    int64_t granule;
+    if (!ahogg_packet(r->ogg, &data, &bytes, &granule)) return false;
+    float *at = r->pcm + r->pcm_len * (size_t)r->info.channels;
+    int n = 0;
+    if (r->vorbis) ahvorbis_decode_packet(r->vorbis, data, bytes, at, &n);
+    else n = (int)ogg_flac_frame(r, data, bytes, at);
+    if (r->ogg_lost) {
+        if (granule >= 0) {
+            r->ogg_lost = false;
+            r->skip = r->ogg_target > granule ? (uint64_t)(r->ogg_target - granule) : 0;
+        }
+        return true;
+    }
+    append(r, (size_t)n);
+    return true;
+}
+
 /* Decodes a little more into pcm. False at the end of the file. `fr_mp3`
    and `fr_aac` (optional) get the frame that gave sound. */
 static bool decode_more(ahreader *r, ahmp3_frame *fr_mp3, ahaac_frame *fr_aac)
@@ -177,6 +225,7 @@ static bool decode_more(ahreader *r, ahmp3_frame *fr_mp3, ahaac_frame *fr_aac)
         r->pcm_pos = 0;
     }
     if (r->m4a) return decode_packet(r);
+    if (r->ogg) return decode_ogg(r);
 
     for (;;) {
         const uint8_t *data = r->in + r->in_pos;
@@ -373,6 +422,93 @@ static const char *open_m4a(ahreader *r)
     return NULL;
 }
 
+/* Vorbis or FLAC in an Ogg file. The pages state where the sound ends; the
+   first page that states a place also tells where the sound starts: the
+   sound decoded up to it ends there. */
+static const char *open_ogg(ahreader *r)
+{
+    const char *error = NULL;
+    r->ogg = ahogg_open(m4a_read, r, r->size - r->base, &error);
+    if (!r->ogg) return error ? error : "not an Ogg file that can be read";
+    const ahogg_info *oi = ahogg_get_info(r->ogg);
+    const uint8_t *data;
+    size_t bytes;
+    if (oi->codec == AHOGG_VORBIS) {
+        r->vorbis = ahvorbis_decoder_new();
+        if (!r->vorbis) return "out of memory";
+        ahvorbis_format f = {0};
+        for (int i = 0; i < 3; i++)
+            if (!ahogg_header(r->ogg, i, &data, &bytes) || !ahvorbis_decoder_header(r->vorbis, data, bytes, &f)) {
+                const char *why = ahvorbis_decoder_error(r->vorbis);
+                return why ? why : "the Vorbis headers are damaged";
+            }
+        r->info.kind = AHREADER_VORBIS;
+        r->info.name = "Vorbis";
+        r->info.sample_rate = f.sample_rate;
+        r->info.channels = f.channels;
+        r->info.channel_mask = f.channel_mask;
+        r->pcm_cap = 2 * AHVORBIS_MAX_SAMPLES;
+    } else {
+        /* The first packet carries FLAC's own stream information block: hand
+           the decoder that, as a FLAC file would start. */
+        if (!ahogg_header(r->ogg, 0, &data, &bytes) || bytes < 51) return "the Ogg FLAC headers are damaged";
+        uint8_t head[4 + 4 + 34] = {'f', 'L', 'a', 'C', 0x80, 0, 0, 34};
+        memcpy(head + 8, data + 17, 34);
+        r->flac = ahflac_decoder_new();
+        if (!r->flac) return "out of memory";
+        ahflac_format f = {0};
+        size_t pos = 0, used;
+        int n;
+        do {
+            used = ahflac_decode(r->flac, head + pos, sizeof(head) - pos, false, NULL, 0, &n, &f);
+            pos += used;
+        } while (used && pos < sizeof(head));
+        if (ahflac_decoder_error(r->flac) || !f.sample_rate) return "the Ogg FLAC headers are damaged";
+        r->info.kind = AHREADER_OGG_FLAC;
+        r->info.name = "Ogg FLAC";
+        r->info.sample_rate = f.sample_rate;
+        r->info.channels = f.channels;
+        r->info.bits = f.bits;
+        r->pcm_cap = (size_t)f.max_block;
+        r->ints = malloc(r->pcm_cap * (size_t)f.channels * sizeof(int32_t));
+        if (!r->ints) return "out of memory";
+    }
+    r->pcm = malloc(r->pcm_cap * (size_t)r->info.channels * sizeof(float));
+    if (!r->pcm) return "out of memory";
+
+    /* Where the sound starts: what is decoded before the first page that
+       states a place ends at that place. A stream whose first such page is
+       also its last states only where it ends. */
+    int64_t got = 0, granule = -1;
+    bool any = false, last = false;
+    for (int packets = 0; packets < 100000 && granule < 0; packets++) {
+        if (!ahogg_packet(r->ogg, &data, &bytes, &granule)) break;
+        last = ahogg_last_page(r->ogg);
+        int n = 0;
+        if (r->vorbis) any |= ahvorbis_decode_packet(r->vorbis, data, bytes, r->pcm, &n);
+        else n = (int)ogg_flac_frame(r, data, bytes, r->pcm);
+        got += n;
+        any |= n > 0;
+    }
+    if (!any) return "the Ogg file holds no sound that could be decoded";
+    r->ogg_first = granule >= 0 && !last ? granule - got : 0;
+    r->ogg_start = r->ogg_first > 0 ? r->ogg_first : 0;
+    if (oi->last_granule >= 0) {
+        r->play_total = oi->last_granule > r->ogg_start ? (uint64_t)(oi->last_granule - r->ogg_start) : 0;
+        r->left = r->play_total;
+        r->info.samples = r->play_total;
+        r->info.samples_exact = true;
+    } else {
+        r->play_total = UINT64_MAX;
+    }
+    /* And back to the start. */
+    ahogg_seek(r->ogg, -1);
+    if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
+    else ahflac_decoder_reset(r->flac);
+    r->skip = (uint64_t)(r->ogg_start - r->ogg_first);
+    return NULL;
+}
+
 static const char *open_mpeg(ahreader *r, uint64_t tag)
 {
     r->mp3 = ahmp3_decoder_new();
@@ -562,6 +698,9 @@ ahreader *ahreader_open(ahreader_read_fn read, void *user, uint64_t size, const 
     } else if (got >= 12 && !memcmp(head + 4, "ftyp", 4)) {
         r->base = tag;
         why = open_m4a(r);
+    } else if (got >= 4 && !memcmp(head, "OggS", 4)) {
+        r->base = tag;
+        why = open_ogg(r);
     } else {
         /* MPEG audio and ADTS both start with eleven 1 bits; ADTS has two
            0 bits where MPEG audio names its layer. */
@@ -593,7 +732,9 @@ void ahreader_close(ahreader *r)
     ahflac_decoder_free(r->flac);
     ahwav_decoder_free(r->wav);
     ahalac_decoder_free(r->alac);
+    ahvorbis_decoder_free(r->vorbis);
     ahm4a_close(r->m4a);
+    ahogg_close(r->ogg);
     free(r->in);
     free(r->pcm);
     free(r->ints);
@@ -715,6 +856,24 @@ bool ahreader_seek(ahreader *r, uint64_t sample)
         r->next_packet = first;
         r->skip = at - first * r->packet_samples;
         r->left = r->play_total - sample;
+    } else if (r->ogg) {
+        /* Back to a page a little before; the place is known once a page
+           states it, and the sound up to the target goes. */
+        if (sample > (uint64_t)INT64_MAX / 2) {
+            r->ended = true; /* no stream runs that long */
+            return false;
+        }
+        int64_t target = r->ogg_start + (int64_t)sample;
+        if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
+        else ahflac_decoder_reset(r->flac);
+        if (ahogg_seek(r->ogg, target)) {
+            r->ogg_lost = true;
+            r->ogg_target = target;
+        } else {
+            r->ogg_lost = false;
+            r->skip = (uint64_t)(target - r->ogg_first);
+        }
+        if (r->play_total != UINT64_MAX) r->left = r->play_total - sample;
     } else if (r->flac) {
         flac_seek(r, sample);
     } else {

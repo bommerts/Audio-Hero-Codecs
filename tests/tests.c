@@ -1179,6 +1179,7 @@ int main(int argc, char **argv)
             if (!strcmp(argv[i + 1], "convert")) test_convert();
             if (!strcmp(argv[i + 1], "reader")) test_reader();
             if (!strcmp(argv[i + 1], "alac")) test_alac();
+            if (!strcmp(argv[i + 1], "vorbis")) test_vorbis();
             printf("%d checks, %d failed\n", g_checks, g_failures);
             return g_failures ? 1 : 0;
         }
@@ -1245,6 +1246,8 @@ int main(int argc, char **argv)
     test_aac();
     printf("Apple Lossless\n");
     test_alac();
+    printf("Vorbis and Ogg\n");
+    test_vorbis();
     test_convert();
     printf("one reader for every kind of file\n");
     test_reader();

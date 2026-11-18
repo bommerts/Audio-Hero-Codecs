@@ -226,5 +226,10 @@ void test_reader(void)
     check_file("reader_6ch.flac", "-ac 6 -c:a flac", NULL, AHREADER_FLAC, true, true);
     check_file("reader_alac.m4a", "-c:a alac", NULL, AHREADER_ALAC, true, true);
     check_file("reader_alac_24_6ch.m4a", "-ac 6 -c:a alac -sample_fmt s32p", NULL, AHREADER_ALAC, true, true);
+    check_file("reader.ogg", "-c:a libvorbis -q:a 4", NULL, AHREADER_VORBIS, false, true);
+    check_file("reader_mono.ogg", "-ar 22050 -ac 1 -c:a libvorbis -q:a 0", NULL, AHREADER_VORBIS, false, true);
+    check_file("reader_6ch.ogg", "-ac 6 -c:a libvorbis", NULL, AHREADER_VORBIS, false, true);
+    check_file("reader_flac.oga", "-c:a flac", NULL, AHREADER_OGG_FLAC, true, true);
+    check_file("reader_flac_24_6ch.oga", "-ac 6 -c:a flac -sample_fmt s32 -bits_per_raw_sample 24", NULL, AHREADER_OGG_FLAC, true, true);
     check_refused("reader_fragmented.mp4", "-c:a aac -movflags frag_keyframe+empty_moov -f mp4", "fragmented");
 }

@@ -6,7 +6,8 @@
    function that reads.
 
    Kinds: MP3 and MPEG Layers I and II, FLAC, AAC as ADTS (.aac) or in MP4
-   (.m4a), Apple Lossless (in .m4a), and WAV. See each decoder's header for what it does not handle. */
+   (.m4a), Apple Lossless (in .m4a), WAV, and Vorbis or FLAC in Ogg (.ogg,
+   .oga). See each decoder's header for what it does not handle. */
 #ifndef AHREADER_H
 #define AHREADER_H
 
@@ -31,6 +32,8 @@ typedef enum {
     AHREADER_M4A, /* AAC in MP4 */
     AHREADER_WAV,
     AHREADER_ALAC, /* Apple Lossless, in MP4 */
+    AHREADER_VORBIS,   /* Vorbis, in Ogg */
+    AHREADER_OGG_FLAC, /* FLAC, in Ogg */
 } ahreader_kind;
 
 typedef struct {
@@ -40,7 +43,8 @@ typedef struct {
     int channels;          /* 1 to 8 */
     uint32_t channel_mask; /* which speaker each channel is for, as ahmix.h
                               numbers them; 0 when the file does not say */
-    int bits;              /* per sample of a FLAC, ALAC or whole-number WAV file, else 0 */
+    int bits;              /* per sample of a FLAC (native or in Ogg), ALAC or
+                              whole-number WAV file, else 0 */
     uint64_t samples;      /* per channel in the file; 0 when it cannot be told */
     bool samples_exact;    /* false: samples is worked out from the file's
                               size and bit rate (an MP3 file without a

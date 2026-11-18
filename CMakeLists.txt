@@ -33,6 +33,8 @@ add_library(ahcodecs STATIC
   src/ahaac_decode.c
   src/ahm4a.c
   src/ahalac.c
+  src/ahogg.c
+  src/ahvorbis.c
   src/ahreader.c
   src/ahresample.c
   src/ahmix.c)
@@ -52,6 +54,7 @@ add_executable(ahmp3_tests
   tests/test_flac.c
   tests/test_aac.c
   tests/test_alac.c
+  tests/test_vorbis.c
   tests/test_convert.c
   tests/test_reader.c)
 target_link_libraries(ahmp3_tests ahcodecs)
