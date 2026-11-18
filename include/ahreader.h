@@ -52,7 +52,13 @@ typedef struct {
                               size and bit rate (an MP3 file without a
                               length header) and may be a little off */
     bool half_rate;        /* an HE-AAC file, played as the plain AAC inside
-                              it: half the sample rate, no top treble */
+                              it: half the sample rate, no top treble. A
+                              caller that wants the whole sound hands such
+                              a file to the system's decoder. */
+    bool parametric_stereo; /* an HE-AAC v2 file that says it uses
+                              parametric stereo: it plays here in mono. An
+                              ADTS file cannot say so; one with half_rate
+                              set and one channel may use it too. */
 } ahreader_info;
 
 typedef struct ahreader ahreader;

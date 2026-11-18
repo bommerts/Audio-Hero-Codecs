@@ -12,7 +12,7 @@ standard to follow, and the one (Opus) whose standard is code.
 | MP3 (MPEG-1/2/2.5 Layer III) | yes | yes | `ahmp3.h` |
 | MPEG Layers I and II (.mp1, .mp2) | yes | | `ahmp3.h` |
 | FLAC, native (.flac) or in Ogg (.oga) | yes | | `ahflac.h`, `ahogg.h` |
-| AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
+| AAC-LC, as ADTS (.aac) or in MP4 (.m4a); HE-AAC detected | yes | | `ahaac.h`, `ahm4a.h` |
 | Apple Lossless (ALAC), in MP4 (.m4a) | yes | | `ahalac.h`, `ahm4a.h` |
 | Vorbis, in Ogg (.ogg) | yes | | `ahvorbis.h`, `ahogg.h` |
 | Opus, in Ogg (.opus) | yes | | `ahopus.h`, `ahogg.h` |
@@ -75,9 +75,17 @@ to the old name still work.
 - All of AAC-LC: every code book, pulses, mid/side and intensity stereo,
   perceptual noise substitution, temporal noise shaping, long and short
   windows of both shapes
-- Not decoded: HE-AAC's spectral band replication and parametric stereo.
-  Such a file still plays, as the plain AAC inside it: at half the sample
-  rate, without the top of the treble. The decoder says when that happens.
+- AAC stays AAC-LC. HE-AAC is detected and reported, so that a caller can
+  hand such a file to the system's decoder (Windows plays it): by the SBR
+  data in the fill elements of its frames (ADTS or MP4), and in MP4 also by
+  object type 5 or 29, or by the sync word 0x2B7 after the plain settings.
+  MP4 settings that say "no SBR" outright win over SBR data in the frames,
+  as in ffmpeg. Parametric stereo (HE-AAC v2) is
+  reported when the MP4 settings state it (type 29, or sync word 0x548); an
+  ADTS stream cannot state it. Its spectral band replication and parametric
+  stereo are not decoded: played here, such a file gives the plain AAC
+  inside it, at half the sample rate, without the top of the treble (and in
+  mono where parametric stereo was used).
 - Refused with a reason: AAC Main, SSR and LTP, 960-sample frames, more than
   two channels, fragmented MP4
 
@@ -155,7 +163,7 @@ to the old name still work.
 
 ## How it is checked
 
-`tests/` runs about 9,500 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 9,300 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
@@ -189,6 +197,12 @@ ffmpeg as an independent reference:
   8251's test vectors, the range decoder must end every packet in the state
   each vector records, and the sound must match the reference within one
   16-bit step. (The vectors are not part of this repository.)
+- **HE-AAC detection.** MP4 settings that state HE-AAC in each way the
+  standard allows, or leave it out, must be reported as they say. Two
+  one-second HE-AAC files from the Windows Media Foundation encoder (ADTS
+  and M4A, in `tests/fixtures/`) must be reported as HE-AAC, play their
+  tones at 22.05 kHz, and last half as many samples as ffmpeg gives with
+  SBR decoded.
 - **Files from other encoders.** LAME, shine, twolame, libvorbis, ffmpeg's
   own MP2, AAC, FLAC and ALAC encoders, libopus, and the Windows Media Foundation MP3
   and AAC encoders: every file must decode exactly as ffmpeg decodes it.
@@ -248,6 +262,14 @@ rate.
   information can turn into a loud burst.
 - **Free format.** ffmpeg does not decode free-format streams. This decoder
   does.
+- **Where AAC settings state HE-AAC.** The standard puts the sync word
+  0x2B7 right after the plain AAC settings, and that is the only place this
+  decoder looks; ffmpeg searches for it bit by bit. Settings with the sync
+  word anywhere else are HE-AAC to ffmpeg and plain AAC-LC here. ffmpeg also
+  leaves SBR open when the stated full rate equals the plain rate
+  (downsampled SBR); this decoder reports such a file as HE-AAC, since it
+  is one, though it plays at the rate stated rather than half of it. Only
+  the report differs: the sound decoded here is the same.
 - **AAC intensity stereo with "all bands mid/side".** The standard turns the
   right channel over only when the mid/side flags are sent band by band;
   ffmpeg also does it when the stream says "all bands". This decoder follows
@@ -524,7 +546,10 @@ take just the files you need:
 - The length of an MP3 file that carries no length header is worked out
   from its size and bit rate, which is only right when the bit rate is
   constant. A seek in such a file is still exact.
-- HE-AAC (SBR and parametric stereo), and AAC with more than two channels.
+- Decoding HE-AAC's spectral band replication and parametric stereo (it is
+  detected and reported instead), and AAC with more than two channels.
+- Parametric stereo in an ADTS stream, or in MP4 settings that do not state
+  it, is not detected: finding it means decoding the SBR data it sits in.
 - Apple Lossless packets of more than 65,536 samples. Encoders write 4,096;
   ffmpeg reads up to about 16 million, but a decoder holding that much
   would not be small.
@@ -556,5 +581,6 @@ their patents on it free of royalties (a pool formed in 2022 says other
 patents read on it), and Apple published Apple Lossless as open source, free of
 royalties, in 2011. AAC-LC dates from 1997 and its own patents are widely
 held to have run out, but a patent pool still offers an AAC license that
-bundles it with the later HE-AAC additions, which this code leaves out.
+bundles it with the later HE-AAC additions, which this code detects but
+does not decode.
 This is not legal advice; if you ship a product, check for yourself.

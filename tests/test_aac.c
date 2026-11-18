@@ -845,6 +845,187 @@ static void test_m4a(void)
     free(out.p);
 }
 
+/* ---- HE-AAC: detected and reported, not decoded ------------------------------- */
+
+/* AAC settings as an MP4 holds them, rate number `sr` inside: `object` 2, 5 or 29;
+   `sbr` -1 for no sync word 0x2B7 after the plain settings, else its SBR
+   flag; `ps` -1 for no sync word 0x548, else its PS flag; `extension` sets
+   the extension flag (and a flag 3 after it). */
+static void he_settings(bitw *w, int object, int sr, int channels, bool extension, int sbr, int ps)
+{
+    memset(w, 0, sizeof(*w));
+    put(w, (unsigned)object, 5);
+    put(w, (unsigned)sr, 4);
+    put(w, (unsigned)channels, 4);
+    if (object != 2) {
+        put(w, (unsigned)sr - 3, 4); /* twice the rate with the extension */
+        put(w, 2, 5);
+    }
+    put(w, 0, 2); /* 1024-sample frames, no core coder */
+    put(w, extension, 1);
+    if (extension) put(w, 0, 1);
+    if (sbr >= 0) {
+        put(w, 0x2B7, 11);
+        put(w, 5, 5);
+        put(w, (unsigned)sbr, 1);
+        if (sbr) {
+            put(w, (unsigned)sr - 3, 4);
+            if (ps >= 0) {
+                put(w, 0x548, 11);
+                put(w, (unsigned)ps, 1);
+            }
+        }
+    }
+}
+
+/* Sets a decoder up with the settings and reports what a frame says. */
+static bool he_report(ahaac_decoder *d, const bitw *w, ahaac_frame *fr)
+{
+    float buf[AHAAC_MAX_SAMPLES * AHAAC_MAX_CHANNELS];
+    int n;
+    memset(fr, 0, sizeof(*fr));
+    bool ok = ahaac_decoder_configure(d, w->p, (size_t)(w->bits + 7) / 8);
+    ahaac_decode_packet(d, w->p, 0, buf, &n, fr);
+    return ok;
+}
+
+/* The power of one tone in one channel (Goertzel). */
+static double tone_power(const pcm *p, int channel, size_t from, size_t to, double freq)
+{
+    double c = 2 * cos(2 * 3.14159265358979323846 * freq / p->rate), s1 = 0, s2 = 0;
+    for (size_t i = from; i < to; i++) {
+        double s0 = p->p[i * (size_t)p->channels + (size_t)channel] + c * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    return s1 * s1 + s2 * s2 - c * s1 * s2;
+}
+
+static void test_he_aac(void)
+{
+    /* Every way the settings can state HE-AAC, or leave it out. */
+    static const struct {
+        const char *what;
+        int object, channels;
+        bool extension;
+        int sbr, ps;
+        bool want_sbr, want_ps;
+    } cases[] = {
+        {"plain AAC-LC", 2, 2, false, -1, -1, false, false},
+        {"plain AAC-LC with the extension flag", 2, 2, true, -1, -1, false, false},
+        {"type 5", 5, 2, false, -1, -1, true, false},
+        {"type 29", 29, 1, false, -1, -1, true, true},
+        {"sync word 0x2B7, SBR", 2, 2, false, 1, -1, true, false},
+        {"sync word 0x2B7 after the extension flag", 2, 2, true, 1, -1, true, false},
+        {"sync word 0x2B7, no SBR", 2, 2, false, 0, -1, false, false},
+        {"sync words 0x2B7 and 0x548, PS", 2, 1, false, 1, 1, true, true},
+        {"sync words 0x2B7 and 0x548, no PS", 2, 1, false, 1, 0, true, false},
+        {"type 5, then sync words that are not read", 5, 1, false, 1, 1, true, false},
+    };
+    static bitw w;
+    ahaac_frame fr;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        he_settings(&w, cases[i].object, 7, cases[i].channels, cases[i].extension, cases[i].sbr, cases[i].ps);
+        ahaac_decoder *d = ahaac_decoder_new();
+        bool ok = he_report(d, &w, &fr);
+        CHECK(ok && fr.sbr == cases[i].want_sbr && fr.ps == cases[i].want_ps, "HE-AAC settings, %s: %s, SBR %d, PS %d", cases[i].what,
+              ok ? "taken" : "refused", fr.sbr, fr.ps);
+        ahaac_decoder_free(d);
+    }
+    /* A sync word with a different number after it is not HE-AAC; and new
+       settings forget what the old ones said. */
+    he_settings(&w, 2, 7, 2, false, -1, -1);
+    put(&w, 0x2B6, 11);
+    put(&w, 5, 5);
+    put(&w, 1, 1);
+    ahaac_decoder *d = ahaac_decoder_new();
+    CHECK(he_report(d, &w, &fr) && !fr.sbr, "a wrong sync word read as HE-AAC");
+    he_settings(&w, 29, 7, 1, false, -1, -1);
+    he_report(d, &w, &fr);
+    he_settings(&w, 2, 7, 2, false, -1, -1);
+    CHECK(he_report(d, &w, &fr) && !fr.sbr && !fr.ps, "plain settings after HE-AAC ones still say HE-AAC");
+    ahaac_decoder_free(d);
+
+    /* A packet with SBR data in a fill element: settings that say nothing
+       leave it to the packet; settings that say "no SBR" outright win (as in
+       ffmpeg); settings cut off before the SBR flag say nothing. */
+    aac_kind k = {4, 2, T_FILL};
+    static t_chan ch[2];
+    unsigned char ms_used[8][51] = {{0}};
+    bytes frame = {0};
+    craft_channel(&ch[0], &k, 5, 120);
+    craft_channel(&ch[1], &k, 5, 120);
+    CHECK(aac_frame_write(&k, ch, true, 0, ms_used, 2, &frame), "the frame with SBR data could not be written");
+    static const struct {
+        const char *what;
+        int sbr, cut;
+        bool want;
+    } stated[] = {{"no sync word", -1, 0, true}, {"SBR", 1, 0, true}, {"no SBR", 0, 0, false}, {"cut off before the SBR flag", 1, 32, true}};
+    for (size_t i = 0; i < sizeof(stated) / sizeof(stated[0]) && frame.len > 7; i++) {
+        he_settings(&w, 2, 4, 2, false, stated[i].sbr, -1);
+        if (stated[i].cut) {
+            w.bits = stated[i].cut;
+            memset(w.p + stated[i].cut / 8, 0, sizeof(w.p) - (size_t)stated[i].cut / 8);
+        }
+        ahaac_decoder *pd = ahaac_decoder_new();
+        bool ok = ahaac_decoder_configure(pd, w.p, (size_t)(w.bits + 7) / 8);
+        float buf[AHAAC_MAX_SAMPLES * AHAAC_MAX_CHANNELS];
+        int n = 0;
+        ahaac_frame got = {0};
+        bool decoded = ahaac_decode_packet(pd, frame.p + 7, frame.len - 7, buf, &n, &got);
+        CHECK(ok && decoded && n == AHAAC_MAX_SAMPLES && got.sbr == stated[i].want, "SBR data in a packet, settings %s: %s, %d samples, SBR %d",
+              stated[i].what, ok ? "taken" : "refused", n, got.sbr);
+        ahaac_decoder_free(pd);
+    }
+    free(frame.p);
+
+    /* Files made by Windows' AAC encoder (ffmpeg's aac_mf, stereo at 48
+       kb/s): one second, 440 Hz on the left and 660 Hz on the right. The
+       ADTS file states 22.05 kHz AAC-LC and carries SBR in fill elements;
+       the M4A file states type 5. Both play here at 22.05 kHz. */
+    static const char *const names[] = {"he_aac.aac", "he_aac.m4a"};
+    for (int f = 0; f < 2; f++) {
+        char path[1000];
+        snprintf(path, sizeof(path), "%s/%s", AHMP3_FIXTURES, names[f]);
+        bytes file = {0};
+        if (!read_file(path, &file)) {
+            CHECK(false, "%s: the file is missing", path);
+            continue;
+        }
+        pcm out = {0};
+        ahreader_info info = {0};
+        const char *error = NULL;
+        size_t n = read_through(&file, &out, &info, &error);
+        CHECK(n && info.half_rate && !info.parametric_stereo && info.sample_rate == 22050 && info.channels == 2,
+              "%s: %s, %d Hz, %d channels, half rate %d, PS %d", names[f], error ? error : "opened", info.sample_rate, info.channels,
+              info.half_rate, info.parametric_stereo);
+        CHECK(n >= 22050 - 1024 && n <= 22050 + 3 * 1024, "%s: %zu samples for a second at 22.05 kHz", names[f], n);
+        if (n > 20000) {
+            out.rate = 22050;
+            double l440 = tone_power(&out, 0, 4000, 18000, 440), l660 = tone_power(&out, 0, 4000, 18000, 660);
+            double r440 = tone_power(&out, 1, 4000, 18000, 440), r660 = tone_power(&out, 1, 4000, 18000, 660);
+            CHECK(l440 > 1000 * l660 && r660 > 1000 * r440, "%s: the tones are not where they belong (%.3g %.3g, %.3g %.3g)", names[f], l440,
+                  l660, r440, r660);
+        }
+        /* ffmpeg decodes the SBR too: twice as many samples, at 44.1 kHz.
+           It works on a copy in the scratch folder, since it leaves its
+           output beside its input. */
+        bytes full = {0};
+        size_t ff = 0;
+        if (g_ffmpeg) {
+            char copy[600];
+            path_of(copy, names[f]);
+            bool ok = write_file(copy, file.p, file.len) && ffmpeg_raw(copy, NULL, "f32le", &full);
+            ff = full.len / 8;
+            CHECK(ok && ff + 4096 >= 2 * n && ff <= 2 * n + 4096, "%s: ffmpeg gives %zu samples with SBR, against %zu here", names[f], ff, n);
+        }
+        printf("  %s: HE-AAC reported, %zu samples at %d Hz (ffmpeg with SBR: %zu)\n", names[f], n, info.sample_rate, ff);
+        free(full.p);
+        free(out.p);
+        free(file.p);
+    }
+}
+
 /* ---- streams that are odd, damaged or not handled ------------------------------ */
 
 static void test_odd_streams(void)
@@ -1038,6 +1219,7 @@ void test_aac(void)
     for (int n = 0; n < 9; n++) CHECK(g_escape_sizes[n] > 0, "no escape of size %d was written", n);
     test_stereo_rules();
     test_odd_streams();
+    test_he_aac();
     if (g_ffmpeg) {
         make_source();
         test_encoded("aac_128.aac", "-ar 44100 -c:a aac -b:a 128k -aac_pns 0");

@@ -501,10 +501,13 @@ static void make_floor0(wsetup *s, wfloor *f)
     f->nbooks = rnd_in(1, 3);
     for (int i = 0; i < f->nbooks; i++) {
         int dims = rnd_in(1, 4), bits = rnd_in(1, 3); /* at most 8^4 twin entries */
-        /* Steps of (1 + m * 1) / 4096 * scale; the largest, times the order
-           and the dims, stays under pi. */
+        /* Steps of (smallest + m) * 2^unit; the largest, times the order
+           and the dims, stays under pi. The smallest is at least 3/4 of the
+           largest, so that the angles spread over much of 0 to pi: angles
+           all crowded near 0 make a curve that overflows (libvorbis gives
+           infinities, and ffmpeg refuses the packet). */
         double room = 3.0 / (f->order + dims);
-        int unit = -12, smallest = 1, step = 1;
+        int step = 1, smallest = 3 * ((1 << bits) - 1), unit = -12;
         int largest = smallest + ((1 << bits) - 1) * step;
         while (largest * ldexp(1, unit) > room) unit--;
         while (largest * ldexp(1, unit + 1) <= room && unit < -2) unit++;

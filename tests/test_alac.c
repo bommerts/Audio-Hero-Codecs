@@ -153,6 +153,16 @@ typedef struct {
 /* What the writer used, to check that every part was. */
 static int g_verbatim, g_compressed, g_apart[3], g_mixed, g_modes[16], g_order0, g_order31, g_orders, g_partial, g_lfe, g_dse, g_fil, g_odd_layout;
 
+/* A prediction mode from 1 to 15, one of those used least so far, so that
+   every mode is used whatever random numbers the tests before took. */
+static int rarest_mode(void)
+{
+    int best = rnd_in(1, 15);
+    for (int m = 1; m < 16; m++)
+        if (g_modes[m] < g_modes[best]) best = m;
+    return best;
+}
+
 static void choose_coefs(int16_t *c, int order, int q)
 {
     memset(c, 0, 32 * sizeof(int16_t));
@@ -231,7 +241,7 @@ static void put_element(bitw *w, const alac_kind *k, const ahalac_setup *s, int 
             int mode[2], q[2], factor[2], order[2];
             int16_t coef[2][32];
             for (int c = 0; c < count; c++) {
-                mode[c] = rnd_in(0, 2) ? 0 : k->apple ? rnd_in(1, 15) : 15;
+                mode[c] = rnd_in(0, 2) ? 0 : k->apple ? rarest_mode() : 15;
                 q[c] = rnd_in(0, 2) ? 9 : rnd_in(1, 15);
                 factor[c] = rnd_in(0, 3) ? 4 : rnd_in(k->apple ? 0 : 1, 7);
                 int pick = rnd_in(0, 9);

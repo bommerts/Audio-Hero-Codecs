@@ -1178,6 +1178,7 @@ int main(int argc, char **argv)
             setvbuf(stdout, NULL, _IONBF, 0);
             if (!strcmp(argv[i + 1], "convert")) test_convert();
             if (!strcmp(argv[i + 1], "reader")) test_reader();
+            if (!strcmp(argv[i + 1], "aac")) test_aac();
             if (!strcmp(argv[i + 1], "alac")) test_alac();
             if (!strcmp(argv[i + 1], "vorbis")) test_vorbis();
             if (!strcmp(argv[i + 1], "opus")) test_opus();

@@ -80,6 +80,9 @@ struct ahaac_decoder {
     int prev_shape[2];
     unsigned noise_seed;
     bool sbr;
+    bool ps;             /* parametric stereo, as the settings state it */
+    bool no_sbr;         /* the settings say there is no SBR: fill elements
+                            that hold it are not believed */
 
     bool synced;         /* ADTS */
     unsigned char fixed[3];
@@ -653,7 +656,7 @@ static int decode_block(ahaac_decoder *d, const uint8_t *data, size_t len, float
             if (count == 15) count += get(&b, 8) - 1;
             if (count) {
                 unsigned kind = get(&b, 4);
-                if (kind == 13 || kind == 14) d->sbr = true;
+                if ((kind == 13 || kind == 14) && !d->no_sbr) d->sbr = true;
                 b.pos += count * 8 - 4;
             }
         } else {
@@ -707,6 +710,7 @@ static void fill_frame(const ahaac_decoder *d, ahaac_frame *frame, int channels,
     frame->samples = channels ? AHAAC_MAX_SAMPLES : 0;
     frame->frame_bytes = (int)bytes;
     frame->sbr = d->sbr;
+    frame->ps = d->ps;
 }
 
 /* A frame that could not be decoded leaves nothing to overlap with. */
@@ -720,15 +724,19 @@ static void drop_frame(ahaac_decoder *d)
 bool ahaac_decoder_configure(ahaac_decoder *d, const uint8_t *config, size_t len)
 {
     reader b = {config, len * 8, 0};
+    d->sbr = d->ps = d->no_sbr = false;
     int object = (int)get(&b, 5);
     if (object == 31) object = 32 + (int)get(&b, 6);
     int sr = (int)get(&b, 4);
     if (sr == 15) get(&b, 24); /* a rate spelled out: not one AAC has bands for */
     int channels = (int)get(&b, 4);
+    bool sbr = false, ps = false, stated = false, no_sbr = false;
     if (object == 5 || object == 29) {
         /* HE-AAC stated outright: the rate read above is the plain AAC part's
-           own; skip the rate of the extension to reach what is inside. */
-        d->sbr = true;
+           own; skip the rate of the extension to reach what is inside. Type
+           29 is HE-AAC with parametric stereo. */
+        sbr = stated = true;
+        ps = object == 29;
         if (get(&b, 4) == 15) get(&b, 24);
         object = (int)get(&b, 5);
         if (object == 31) object = 32 + (int)get(&b, 6);
@@ -747,15 +755,35 @@ bool ahaac_decoder_configure(ahaac_decoder *d, const uint8_t *config, size_t len
         return false;
     }
     if (get1(&b)) get(&b, 14); /* depends on a core coder */
-    get1(&b);
+    bool extension = get1(&b);
     if (channels == 0) channels = read_program_config(&b);
     if (channels < 1 || channels > 2) {
         unsupported(d, channels ? "AAC with more than two channels is not supported" : "damaged AAC configuration");
         return false;
     }
+    if (extension) get1(&b); /* a flag kept for later versions */
+    /* HE-AAC stated after the plain AAC settings, where a player that knows
+       only AAC-LC stops reading (ISO/IEC 14496-3): sync word 0x2B7,
+       type 5, a flag, the full rate, and then perhaps sync word 0x548 and a
+       parametric stereo flag. */
+    if (!stated && !over(&b) && b.bits - b.pos >= 16 && get(&b, 11) == 0x2B7) {
+        int ext = (int)get(&b, 5);
+        if (ext == 31) ext = 32 + (int)get(&b, 6);
+        bool flag = ext == 5 && get1(&b);
+        /* "No SBR" stated outright; settings cut off before the flag say nothing. */
+        no_sbr = ext == 5 && !flag && !over(&b);
+        if (flag) {
+            sbr = true;
+            if (get(&b, 4) == 15) get(&b, 24);
+            if (!over(&b) && b.bits - b.pos >= 12 && get(&b, 11) == 0x548) ps = get1(&b);
+        }
+    }
     if (sr != d->sr_index) ahaac_decoder_reset(d);
     d->sr_index = sr;
     d->channel_config = channels;
+    d->sbr = sbr;
+    d->ps = ps;
+    d->no_sbr = no_sbr;
     d->configured = true;
     d->error = NULL;
     return true;

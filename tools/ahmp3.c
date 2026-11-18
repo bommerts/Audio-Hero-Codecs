@@ -83,7 +83,9 @@ static const char *load(const char *path, sound *s)
         s->channels = info->channels;
         s->bits = info->bits;
         s->mask = info->channel_mask;
-        if (info->half_rate) fprintf(stderr, "%s: an HE-AAC file, played as the plain AAC inside it (half the sample rate)\n", path);
+        if (info->half_rate)
+            fprintf(stderr, "%s: an HE-AAC file, played as the plain AAC inside it (half the sample rate%s)\n", path,
+                    info->parametric_stereo ? ", and mono: it uses parametric stereo" : "");
         static float pcm[8 * 4096];
         size_t n;
         while ((n = ahreader_read(r, pcm, 4096)) != 0) sound_put(s, pcm, n * (size_t)s->channels);

@@ -3,10 +3,12 @@
    stereo, from ADTS streams (.aac files) or as the raw packets an MP4/M4A
    file holds (see ahm4a.h). No dependencies beyond the C standard library.
 
-   Not decoded: HE-AAC's spectral band replication and parametric stereo.
-   Such a stream still plays, as the plain AAC inside it: at half the sample
-   rate, without the top of the treble (and in mono where parametric stereo
-   was used). The frame says so in its sbr field. The Main, SSR and LTP
+   HE-AAC is detected and reported, not decoded: its spectral band
+   replication (SBR) and parametric stereo (PS) are left out, so a caller
+   can hand such a stream to the system's decoder instead. Played here, it
+   gives the plain AAC inside it: at half the sample rate, without the top
+   of the treble (and in mono where parametric stereo was used). The frame
+   says so in its sbr and ps fields. The Main, SSR and LTP
    kinds of AAC, 960-sample frames and more than two channels are refused. */
 #ifndef AHAAC_H
 #define AHAAC_H
@@ -29,6 +31,11 @@ typedef struct {
     int samples;     /* per channel: 1024, or 0 when the frame gave no sound */
     int frame_bytes; /* the whole ADTS frame, or the packet */
     bool sbr;        /* the stream carries HE-AAC data that is not decoded */
+    bool ps;         /* the settings state parametric stereo (HE-AAC v2:
+                        type 29, or sync word 0x548). Only raw packets can
+                        tell: an ADTS stream, or settings that leave it
+                        unsaid, may still use it with sbr set and one
+                        channel, and this stays false. */
 } ahaac_frame;
 
 typedef struct ahaac_decoder ahaac_decoder;

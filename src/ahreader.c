@@ -409,6 +409,7 @@ static const char *open_m4a(ahreader *r)
     r->info.sample_rate = fr.sample_rate;
     r->info.channels = fr.channels;
     r->info.half_rate = fr.sbr;
+    r->info.parametric_stereo = fr.ps;
     /* The file counts in its own time units, which are not always samples
        at the rate the sound decodes at. */
     uint64_t delay = info->delay, samples = info->samples;
@@ -594,6 +595,7 @@ static const char *open_adts(ahreader *r, uint64_t tag)
     r->info.sample_rate = fr.sample_rate;
     r->info.channels = fr.channels;
     r->info.half_rate = fr.sbr;
+    r->info.parametric_stereo = fr.ps;
     r->frame_samples = AHAAC_MAX_SAMPLES;
     r->first_frame = r->in_off + r->in_pos - (uint64_t)fr.frame_bytes;
     /* An ADTS file does not say how long it is: count its frames. */
