@@ -110,7 +110,10 @@ static void check_file(const char *name, const char *encode_args, const char *de
             if (e > worst) worst = e;
         }
         CHECK(lengths, "%s: a seek gave too few samples", name);
-        CHECK(worst <= (exact ? 0 : 1e-4), "%s: after a seek the sound differs by %.2g", name, worst);
+        /* Opus decodes from 200 ms before the target. CELT has settled by
+           then; SILK's long-term predictor carries steady tones on for
+           longer (see the README). */
+        CHECK(worst <= (exact ? 0 : kind == AHREADER_OPUS ? 0.02 : 1e-4), "%s: after a seek the sound differs by %.2g", name, worst);
         /* The end, and past it. */
         if (length_stated) CHECK(!ahreader_seek(r, frames) && ahreader_read(r, buf, 100) == 0, "%s: a seek to the end gave sound", name);
         ahreader_seek(r, (uint64_t)frames + 1000000);
@@ -231,5 +234,9 @@ void test_reader(void)
     check_file("reader_6ch.ogg", "-ac 6 -c:a libvorbis", NULL, AHREADER_VORBIS, false, true);
     check_file("reader_flac.oga", "-c:a flac", NULL, AHREADER_OGG_FLAC, true, true);
     check_file("reader_flac_24_6ch.oga", "-ac 6 -c:a flac -sample_fmt s32 -bits_per_raw_sample 24", NULL, AHREADER_OGG_FLAC, true, true);
+    /* ffmpeg's libopus decoder gives 16-bit samples unless asked for floats. */
+    check_file("reader.opus", "-c:a libopus -b:a 96k", "-c:a libopus -request_sample_fmt flt", AHREADER_OPUS, false, true);
+    check_file("reader_voice.opus", "-ac 1 -c:a libopus -b:a 16k -application voip", "-c:a libopus -request_sample_fmt flt", AHREADER_OPUS, false, true);
+    check_file("reader_6ch.opus", "-ac 6 -c:a libopus", "-c:a libopus -request_sample_fmt flt", AHREADER_OPUS, false, true);
     check_refused("reader_fragmented.mp4", "-c:a aac -movflags frag_keyframe+empty_moov -f mp4", "fragmented");
 }

@@ -869,7 +869,7 @@ static void put_audio(bitw *w, const wsetup *s, int mode, bool prev_long, bool n
 
 /* ---- Ogg pages ------------------------------------------------------------------ */
 
-static uint32_t ogg_crc(const uint8_t *p, size_t n)
+uint32_t ogg_crc(const uint8_t *p, size_t n)
 {
     uint32_t crc = 0;
     for (size_t i = 0; i < n; i++) {
@@ -878,12 +878,6 @@ static uint32_t ogg_crc(const uint8_t *p, size_t n)
     }
     return crc;
 }
-
-typedef struct {
-    bytes data;
-    int64_t end;    /* granule position at the end of the packet */
-    bool page_end;  /* a page ends after it */
-} opacket;
 
 static void le_put(bytes *b, uint64_t v, int n)
 {
@@ -914,7 +908,7 @@ static void page_out(bytes *out, uint32_t serial, uint32_t *seq, int flags, int6
 
 /* Cuts the packets into pages: at most max_segs segments a page (a random
    number when 0), and a page end wherever a packet asks for one. */
-static void ogg_write(bytes *out, uint32_t serial, const opacket *pk, int count, int max_segs)
+void ogg_write(bytes *out, uint32_t serial, const opacket *pk, int count, int max_segs)
 {
     uint8_t lacing[255];
     bytes body = {0};
@@ -949,7 +943,7 @@ static void ogg_write(bytes *out, uint32_t serial, const opacket *pk, int count,
 
 /* ---- streams against ffmpeg ----------------------------------------------------- */
 
-static size_t read_through(const bytes *file, pcm *out, ahreader_info *info, const char **error)
+size_t read_through(const bytes *file, pcm *out, ahreader_info *info, const char **error)
 {
     out->len = 0;
     ahreader *r = ahreader_open(test_memory_read, (void *)file, file->len, error);
@@ -1037,7 +1031,7 @@ static void debug_stream(const bytes *file)
     ahogg_close(o);
 }
 
-static bool same_pcm(const pcm *a, const pcm *b)
+bool same_pcm(const pcm *a, const pcm *b)
 {
     return a->len == b->len && (!a->len || !memcmp(a->p, b->p, a->len * sizeof(float)));
 }
@@ -1846,9 +1840,10 @@ static void test_page_fuzz(void)
     CHECK(!r && error, "false page starts were taken for a file");
     ahreader_close(r);
     free(fake.p);
-    /* Opus is named in the refusal. */
+    /* An Opus stream of a kind not handled (mapping family 2) is refused,
+       and Opus named in the refusal. */
     opacket opus[2] = {{{0}}};
-    bytes_put(&opus[0].data, "OpusHead\1\2\0\0\x80\xBB\0\0\0\0\0", 19);
+    bytes_put(&opus[0].data, "OpusHead\1\2\0\0\x80\xBB\0\0\0\0\2", 19);
     opus[0].page_end = true;
     bytes_put(&opus[1].data, "OpusTags", 8);
     bytes file = {0};

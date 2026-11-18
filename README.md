@@ -5,7 +5,7 @@ in plain C, written from the published standards with no dependencies beyond
 the C standard library. They were built for the Audio Hero Companion, which
 streams music to network audio devices, and are published here for anyone to
 use. [EXCEPTIONS.md](EXCEPTIONS.md) lists the formats with no published
-standard to follow.
+standard to follow, and the one (Opus) whose standard is code.
 
 | Format | Decode | Encode | Header |
 | --- | --- | --- | --- |
@@ -15,6 +15,7 @@ standard to follow.
 | AAC-LC, as ADTS (.aac) or in MP4 (.m4a) | yes | | `ahaac.h`, `ahm4a.h` |
 | Apple Lossless (ALAC), in MP4 (.m4a) | yes | | `ahalac.h`, `ahm4a.h` |
 | Vorbis, in Ogg (.ogg) | yes | | `ahvorbis.h`, `ahogg.h` |
+| Opus, in Ogg (.opus) | yes | | `ahopus.h`, `ahogg.h` |
 | WAV | yes | | `ahwav.h` |
 
 Around them:
@@ -102,15 +103,26 @@ to the old name still work.
 - A packet cut short is decoded as far as it goes, as the specification
   says
 
+**Opus decoder**
+- Every mode: SILK (speech), CELT (music) and the hybrid of the two, every
+  bandwidth and frame size (2.5 to 60 ms, packets up to 120 ms), mono and
+  stereo, and up to 8 channels in the streams of mapping family 0 or 1
+- The switches between modes as RFC 6716 defines them, with the redundant
+  frames encoders send there; the header's output gain applied
+- Always 48 kHz; the channels given out in WAV order with a channel mask
+- A lost or damaged packet is covered over for its length, the way libopus
+  does it (see below), so the sound after it keeps its place
+
 **Ogg reader**
-- Finds the first Vorbis or FLAC stream in an Ogg file, past any other
+- Finds the first Vorbis, FLAC or Opus stream in an Ogg file, past any other
   streams mixed in with it
 - Gathers packets across pages, checks every page's checksum, and leaves
   out damaged pages and the packets they break
 - Says where the stream ends and finds where to start reading for a seek,
   by halving the file and then walking its pages
 - Applies what the pages state: the start of the sound (an encoder's run-in
-  to drop) and its end
+  to drop, and Opus's pre-skip) and its end; an Opus seek starts 200 ms
+  early so the decoder settles (RFC 7845 asks for at least 80 ms)
 
 **WAV reader**
 - RIFF/WAVE and RF64, plain and extensible headers
@@ -143,7 +155,7 @@ to the old name still work.
 
 ## How it is checked
 
-`tests/` runs about 9,300 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 9,500 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
@@ -165,8 +177,20 @@ ffmpeg as an independent reference:
   sound, and ffmpeg must give the twin's to floating point precision. Floor
   lines that run past the end of a block are checked against the
   specification's steps followed to the letter.
+- **Random Opus streams.** Packets of random frames in every mode, size and
+  framing (all four packet codes, padding, the self-delimited framing of
+  multistream packets), mono and stereo switching freely, up to 8 channels
+  in up to 4 streams with silent channels, a random pre-skip, output gain and
+  end cut. ffmpeg's libopus decoder must give the same sound to floating
+  point precision. Files from libopus in 19 settings (SILK, hybrid and CELT,
+  2.5 to 120 ms, constant bit rate, forward error correction, 3 to 8
+  channels) must too.
+- **The Opus test vectors.** With `AHOPUS_VECTORS` set to the folder of RFC
+  8251's test vectors, the range decoder must end every packet in the state
+  each vector records, and the sound must match the reference within one
+  16-bit step. (The vectors are not part of this repository.)
 - **Files from other encoders.** LAME, shine, twolame, libvorbis, ffmpeg's
-  own MP2, AAC, FLAC and ALAC encoders and the Windows Media Foundation MP3
+  own MP2, AAC, FLAC and ALAC encoders, libopus, and the Windows Media Foundation MP3
   and AAC encoders: every file must decode exactly as ffmpeg decodes it.
   Ogg files from ffmpeg are also cut into pages anew at random, and must
   give the same sound. WAV files
@@ -181,7 +205,15 @@ ffmpeg as an independent reference:
   to the same length; the length the reader states must be the length it
   gives; and a seek to any sample must give what a read from the start
   gives there (exactly for FLAC, ALAC, Vorbis and WAV, to floating point
-  precision for the rest). Ogg files are also checked with their pages cut
+  precision for the rest but Opus). An Opus decoder that starts mid-stream
+  settles but not to the last bit: the reader decodes 200 ms before the
+  target (RFC 7845 asks for at least 80). CELT has settled by then (80 ms
+  left up to 7% of full scale). SILK's long-term predictor carries a steady
+  tone from frame to frame, so on the tests' steady tones a SILK decoder
+  started mid-stream stays about 1% of full scale off for seconds (libopus
+  does the same). An Opus seek must line up to the sample and come within 2%
+  of full scale; near the start, where it decodes from the start, it must
+  be exact. Ogg files are also checked with their pages cut
   every way, down to a few bytes, and with other streams mixed in.
 - **Sample rate conversion against the mathematics.** A tone resampled is
   the same tone at the new rate. For 18 pairs of rates, tones across the
@@ -274,12 +306,29 @@ rate.
   which gives no sound, as if it did, and cuts that much too much from the
   end: 128 samples from libvorbis's files. This decoder ends where the page
   says, which gives back exactly as many samples as went into the encoder.
+- **Opus loss cover.** A lost packet (or one libopus refuses as damaged,
+  in whose place ffmpeg plays nothing) is covered over for the length it
+  states, so the sound after it stays where the pages put it. RFC 6716
+  leaves the cover to the decoder. This decoder follows libopus where its
+  way is known: SILK's cover from the RFC's reference decoder, and noise in
+  the shape of the last band energies for CELT bands. libopus covers a lost
+  CELT-only frame with a pitch-based method of its own, so the sound in its
+  place differs. The same cover joins a switch from SILK or hybrid to CELT
+  that the encoder sent without a redundant frame: libopus's own files match
+  there, but in random streams the 5 ms join can differ, and the tests leave
+  those 5 ms out. A page whose checksum fails is left out with its
+  packets (as for Vorbis), so its sound is missing, not covered.
+- **Opus start before the first page.** A stream whose first page of sound
+  states fewer samples than its packets hold (and is not its last page) is
+  invalid by RFC 7845. It is played as an Ogg Vorbis start would be, with
+  the samples before position 0 dropped.
 - **Mono to stereo.** ffmpeg plays a one-channel file 3 dB down on each
   side. The mix here puts it on both sides as it is, so a mono file is no
   quieter than a stereo one.
 
-Apart from short Ogg Vorbis files, encoders in common use write none of
-these, so files play the same in both.
+Apart from short Ogg Vorbis files and Opus switches into CELT without a
+redundant frame, encoders in common use write none of these, so files play
+the same in both.
 
 One thing is the same on purpose: the noise that fills AAC's noise bands
 comes from the same simple generator and starting value that ffmpeg uses, so
@@ -305,6 +354,8 @@ On one core of a desktop PC:
 | FLAC decode (16-bit, 44.1 kHz) | 1000 |
 | ALAC decode (16-bit, 44.1 kHz) | 500 |
 | Vorbis decode (44.1 kHz stereo, quality 5) | 600 |
+| Opus decode, 128 kbps stereo music (CELT) | 250 |
+| Opus decode, 16 kbps mono speech (SILK) | 600 |
 | MP3 encode | 50 to 100 |
 | Sample rate conversion, 48 to 44.1 kHz stereo | 500 |
 
@@ -385,7 +436,9 @@ float pcm[AHVORBIS_MAX_SAMPLES * AHVORBIS_MAX_CHANNELS];
 while (ahogg_packet(o, &data, &bytes, &granule))
     ahvorbis_decode_packet(d, data, bytes, pcm, &samples);
 /* The pages' granule positions say where the sound starts and ends; the
-   reader below applies them, and seeks. */
+   reader below applies them, and seeks. Opus is the same with ahopus.h:
+   ahopus_decoder_header() takes the first header (OpusHead), and the
+   header's pre-skip is dropped from the start. */
 ```
 
 Or let the reader pick the decoder, and bring whatever the file holds to
@@ -418,7 +471,7 @@ ahreader_seek(r, 30 * (uint64_t)info->sample_rate); /* to 0:30 */
 Each header documents its whole interface: [ahmp3.h](include/ahmp3.h),
 [ahflac.h](include/ahflac.h), [ahaac.h](include/ahaac.h),
 [ahalac.h](include/ahalac.h), [ahm4a.h](include/ahm4a.h),
-[ahvorbis.h](include/ahvorbis.h), [ahogg.h](include/ahogg.h),
+[ahvorbis.h](include/ahvorbis.h), [ahopus.h](include/ahopus.h), [ahogg.h](include/ahogg.h),
 [ahwav.h](include/ahwav.h),
 [ahreader.h](include/ahreader.h), [ahresample.h](include/ahresample.h),
 [ahmix.h](include/ahmix.h).
@@ -458,6 +511,7 @@ take just the files you need:
 | AAC | `ahaac_decode.c`, `ahaac_tables.c` |
 | Apple Lossless | `ahalac.c` |
 | Vorbis | `ahvorbis.c` |
+| Opus | `ahopus.c`, `ahopus_silk.c`, `ahopus_celt.c`, `ahopus_tables.c` |
 | M4A | `ahm4a.c` |
 | Ogg | `ahogg.c` |
 | WAV | `ahwav.c` |
@@ -477,7 +531,10 @@ take just the files you need:
 - The MD5 check of a whole FLAC file.
 - Chained Ogg files (one stream after another, as recordings of internet
   radio often are) give only their first stream.
-- Opus, and the other codecs an Ogg file may hold (Speex, Theora video).
+- The other codecs an Ogg file may hold (Speex, Theora video).
+- Opus with more than 8 channels, and Opus mapping families other than 0
+  and 1 (family 255, channels with no stated speaker, and the ambisonics
+  families 2 and 3).
 - Vorbis with more than 8 channels, and Vorbis setups with more than a
   million codebook entries or 4 million vector values in all (libvorbis's
   setups use far fewer).
@@ -485,11 +542,18 @@ take just the files you need:
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE), except the Opus files (`src/ahopus.c`,
+`src/ahopus_silk.c`, `src/ahopus_celt.c`, `src/ahopus_internal.h` and
+`src/ahopus_tables.c`): they follow the reference decoder in RFC 6716 step
+by step, and their tables are copied from it, so they are under that code's
+BSD licence, whose notice is at the top of each file and must go along with
+the files or a program built from them.
 
 On patents: the MP3 patents have expired, FLAC and WAV were never covered
 by any, Xiph.Org published Ogg and Vorbis for anyone to use free of
-royalties, and Apple published Apple Lossless as open source, free of
+royalties, the companies that developed Opus (an IETF standard) license
+their patents on it free of royalties (a pool formed in 2022 says other
+patents read on it), and Apple published Apple Lossless as open source, free of
 royalties, in 2011. AAC-LC dates from 1997 and its own patents are widely
 held to have run out, but a patent pool still offers an AAC license that
 bundles it with the later HE-AAC additions, which this code leaves out.

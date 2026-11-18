@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../include/ahreader.h"
+
 extern int g_checks, g_failures;
 extern bool g_ffmpeg; /* ffmpeg is on the PATH: the checks against it run */
 
@@ -68,8 +70,25 @@ void test_layers(void);
 void test_aac(void);
 void test_alac(void);
 void test_vorbis(void);
+void test_opus(void);
 void test_convert(void);
 void test_reader(void);
+
+/* Ogg pages, for the Ogg tests (in test_vorbis.c). */
+typedef struct {
+    bytes data;
+    int64_t end;   /* granule position at the end of the packet */
+    bool page_end; /* a page ends after it */
+} opacket;
+uint32_t ogg_crc(const uint8_t *p, size_t n);
+/* Cuts the packets into pages: at most max_segs segments a page (a random
+   number when 0), and a page end wherever a packet asks for one. */
+void ogg_write(bytes *out, uint32_t serial, const opacket *pk, int count, int max_segs);
+
+/* All the sound of a file in memory, through ahreader. Returns the samples
+   per channel (0 when it cannot be opened; then *error says why). */
+size_t read_through(const bytes *file, pcm *out, ahreader_info *info, const char **error);
+bool same_pcm(const pcm *a, const pcm *b);
 
 /* A read function over a file held in memory: user is its `bytes`. */
 size_t test_memory_read(void *user, uint64_t offset, void *buffer, size_t n);

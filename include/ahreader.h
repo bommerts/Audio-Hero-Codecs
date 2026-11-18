@@ -6,8 +6,9 @@
    function that reads.
 
    Kinds: MP3 and MPEG Layers I and II, FLAC, AAC as ADTS (.aac) or in MP4
-   (.m4a), Apple Lossless (in .m4a), WAV, and Vorbis or FLAC in Ogg (.ogg,
-   .oga). See each decoder's header for what it does not handle. */
+   (.m4a), Apple Lossless (in .m4a), WAV, and Vorbis, FLAC or Opus in Ogg
+   (.ogg, .oga, .opus). See each decoder's header for what it does not
+   handle. */
 #ifndef AHREADER_H
 #define AHREADER_H
 
@@ -34,6 +35,7 @@ typedef enum {
     AHREADER_ALAC, /* Apple Lossless, in MP4 */
     AHREADER_VORBIS,   /* Vorbis, in Ogg */
     AHREADER_OGG_FLAC, /* FLAC, in Ogg */
+    AHREADER_OPUS,     /* Opus, in Ogg; always 48 kHz */
 } ahreader_kind;
 
 typedef struct {

@@ -1,10 +1,11 @@
 /* Audio Hero Ogg: a reader for the sound stream of an Ogg file (.ogg,
-   .oga), in plain C, written from RFC 3533 and the Vorbis and FLAC
-   mappings onto Ogg. It finds the first Vorbis or FLAC stream in the file,
+   .oga, .opus), in plain C, written from RFC 3533 and the Vorbis, FLAC and
+   Opus (RFC 7845) mappings onto Ogg. It finds the first Vorbis, FLAC or
+   Opus stream in the file,
    collects its header packets, and hands over its sound packets one at a
    time, with the positions its pages give. It says how far the stream
-   runs and finds where to start reading for a seek; ahvorbis.h or ahflac.h
-   decodes the packets. No dependencies beyond the C standard library, and
+   runs and finds where to start reading for a seek; ahvorbis.h, ahflac.h
+   or ahopus.h decodes the packets. No dependencies beyond the C standard library, and
    no file access of its own: the caller supplies a function that reads.
 
    Not handled: a chained file (one stream after another, as recordings of
@@ -28,24 +29,27 @@ typedef size_t (*ahogg_read_fn)(void *user, uint64_t offset, void *buffer, size_
 typedef enum {
     AHOGG_VORBIS = 0,
     AHOGG_FLAC,
+    AHOGG_OPUS,
 } ahogg_codec;
 
 typedef struct {
     ahogg_codec codec;
     uint32_t serial;      /* the stream's number in the file */
     int headers;          /* header packets at the start of the stream: 3 for
-                             Vorbis; for FLAC the first packet and one per
-                             block of information after it */
+                             Vorbis, 2 for Opus; for FLAC the first packet
+                             and one per block of information after it */
     int64_t last_granule; /* the granule position of the stream's last page
                              that has one: where its sound ends, in samples
                              per channel from the stream's start (Vorbis and
-                             FLAC count so); -1 when no page has one */
+                             FLAC count so; Opus counts at 48 kHz, its
+                             pre-skip included); -1 when no page has one */
 } ahogg_info;
 
 typedef struct ahogg ahogg;
 
 /* Opens a file of `size` bytes through `read`. Returns NULL when it is not
-   an Ogg file with a Vorbis or FLAC stream, or its headers are damaged; then
+   an Ogg file with a Vorbis, FLAC or Opus stream, or its headers are
+   damaged; then
    *error (optional) says why. */
 ahogg *ahogg_open(ahogg_read_fn read, void *user, uint64_t size, const char **error);
 void ahogg_close(ahogg *o);

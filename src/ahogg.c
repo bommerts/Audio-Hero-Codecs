@@ -331,8 +331,9 @@ ahogg *ahogg_open(ahogg_read_fn read, void *user, uint64_t size, const char **er
         } else if (first >= 51 && !memcmp(body, "\x7F" "FLAC", 5)) {
             o->info.codec = AHOGG_FLAC;
             found = true;
-        } else if (first >= 8 && !memcmp(body, "OpusHead", 8)) {
-            other = "Ogg Opus is not supported";
+        } else if (first >= 19 && !memcmp(body, "OpusHead", 8)) {
+            o->info.codec = AHOGG_OPUS;
+            found = true;
         }
         if (found) {
             o->info.serial = pg.serial;
@@ -342,15 +343,15 @@ ahogg *ahogg_open(ahogg_read_fn read, void *user, uint64_t size, const char **er
         }
     }
     if (!found) {
-        why = !p && !other ? "not an Ogg file" : other ? other : "the Ogg file holds no Vorbis or FLAC sound";
+        why = !p && !other ? "not an Ogg file" : other ? other : "the Ogg file holds no Vorbis, FLAC or Opus sound";
     } else {
-        /* The headers: three for Vorbis; for FLAC the first packet says how
-           many follow it (0: until the one marked last). */
+        /* The headers: three for Vorbis, two for Opus; for FLAC the first
+           packet says how many follow it (0: until the one marked last). */
         start_over(o, o->first_page);
         const uint8_t *data;
         size_t bytes;
         int64_t granule;
-        int want = 3;
+        int want = o->info.codec == AHOGG_OPUS ? 2 : 3;
         uint64_t after = 0; /* the end of the page the last header ends on */
         for (int i = 0; i < want; i++) {
             if (!any_packet(o, &data, &bytes, &granule)) {
@@ -382,6 +383,7 @@ ahogg *ahogg_open(ahogg_read_fn read, void *user, uint64_t size, const char **er
         /* Pages after the one the last header ends on hold only sound. */
         if (!why) o->audio_from = after;
         if (!why && o->info.codec == AHOGG_VORBIS && (!o->header[0] || !o->header[2])) why = "out of memory";
+        if (!why && o->info.codec == AHOGG_OPUS && !o->header[0]) why = "out of memory";
         if (!why) {
             o->info.last_granule = find_last_granule(o);
             ahogg_seek(o, -1); /* back to the first sound packet */

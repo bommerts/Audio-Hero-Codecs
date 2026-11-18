@@ -8,6 +8,7 @@
 #include "../include/ahmp3.h"
 #include "../include/ahogg.h"
 #include "../include/ahvorbis.h"
+#include "../include/ahopus.h"
 #include "../include/ahwav.h"
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,7 @@ struct ahreader {
     ahwav_decoder *wav;
     ahalac_decoder *alac;
     ahvorbis_decoder *vorbis;
+    ahopus_decoder *opus;
     ahm4a *m4a;
     ahogg *ogg;
     bool ogg_lost;      /* Ogg: after a seek, where the sound decoded lies is
@@ -55,6 +57,7 @@ struct ahreader {
     int64_t ogg_first;  /* where the first sound decoded from the start lies */
     int64_t ogg_start;  /* where the sound played starts */
     int64_t ogg_target; /* where a seek is to land */
+    int64_t opus_pre_skip; /* Opus: samples the header says to drop at the start */
     int32_t *ints;       /* FLAC's and ALAC's whole numbers */
     uint8_t *packet;     /* one M4A packet */
     size_t packet_cap;
@@ -202,6 +205,7 @@ static bool decode_ogg(ahreader *r)
     float *at = r->pcm + r->pcm_len * (size_t)r->info.channels;
     int n = 0;
     if (r->vorbis) ahvorbis_decode_packet(r->vorbis, data, bytes, at, &n);
+    else if (r->opus) ahopus_decode_packet(r->opus, data, bytes, at, &n);
     else n = (int)ogg_flac_frame(r, data, bytes, at);
     if (r->ogg_lost) {
         if (granule >= 0) {
@@ -422,9 +426,10 @@ static const char *open_m4a(ahreader *r)
     return NULL;
 }
 
-/* Vorbis or FLAC in an Ogg file. The pages state where the sound ends; the
-   first page that states a place also tells where the sound starts: the
-   sound decoded up to it ends there. */
+/* Vorbis, FLAC or Opus in an Ogg file. The pages state where the sound
+   ends; the first page that states a place also tells where the sound
+   starts: the sound decoded up to it ends there. Opus drops the header's
+   pre-skip as well (RFC 7845). */
 static const char *open_ogg(ahreader *r)
 {
     const char *error = NULL;
@@ -448,6 +453,21 @@ static const char *open_ogg(ahreader *r)
         r->info.channels = f.channels;
         r->info.channel_mask = f.channel_mask;
         r->pcm_cap = 2 * AHVORBIS_MAX_SAMPLES;
+    } else if (oi->codec == AHOGG_OPUS) {
+        r->opus = ahopus_decoder_new();
+        if (!r->opus) return "out of memory";
+        ahopus_format f = {0};
+        if (!ahogg_header(r->ogg, 0, &data, &bytes) || !ahopus_decoder_header(r->opus, data, bytes, &f)) {
+            const char *why = ahopus_decoder_error(r->opus);
+            return why ? why : "the Opus header is damaged";
+        }
+        r->info.kind = AHREADER_OPUS;
+        r->info.name = "Opus";
+        r->info.sample_rate = f.sample_rate;
+        r->info.channels = f.channels;
+        r->info.channel_mask = f.channel_mask;
+        r->opus_pre_skip = f.pre_skip;
+        r->pcm_cap = 2 * AHOPUS_MAX_SAMPLES;
     } else {
         /* The first packet carries FLAC's own stream information block: hand
            the decoder that, as a FLAC file would start. */
@@ -486,13 +506,18 @@ static const char *open_ogg(ahreader *r)
         last = ahogg_last_page(r->ogg);
         int n = 0;
         if (r->vorbis) any |= ahvorbis_decode_packet(r->vorbis, data, bytes, r->pcm, &n);
+        else if (r->opus) any |= ahopus_decode_packet(r->opus, data, bytes, r->pcm, &n);
         else n = (int)ogg_flac_frame(r, data, bytes, r->pcm);
         got += n;
         any |= n > 0;
     }
     if (!any) return "the Ogg file holds no sound that could be decoded";
     r->ogg_first = granule >= 0 && !last ? granule - got : 0;
+    /* Opus: a stream on one page that states more than it holds still
+       works backwards from its end (RFC 7845 section 4.5). */
+    if (r->opus && last && granule > got) r->ogg_first = granule - got;
     r->ogg_start = r->ogg_first > 0 ? r->ogg_first : 0;
+    if (r->opus && r->ogg_first + r->opus_pre_skip > r->ogg_start) r->ogg_start = r->ogg_first + r->opus_pre_skip;
     if (oi->last_granule >= 0) {
         r->play_total = oi->last_granule > r->ogg_start ? (uint64_t)(oi->last_granule - r->ogg_start) : 0;
         r->left = r->play_total;
@@ -504,6 +529,7 @@ static const char *open_ogg(ahreader *r)
     /* And back to the start. */
     ahogg_seek(r->ogg, -1);
     if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
+    else if (r->opus) ahopus_decoder_reset(r->opus);
     else ahflac_decoder_reset(r->flac);
     r->skip = (uint64_t)(r->ogg_start - r->ogg_first);
     return NULL;
@@ -733,6 +759,7 @@ void ahreader_close(ahreader *r)
     ahwav_decoder_free(r->wav);
     ahalac_decoder_free(r->alac);
     ahvorbis_decoder_free(r->vorbis);
+    ahopus_decoder_free(r->opus);
     ahm4a_close(r->m4a);
     ahogg_close(r->ogg);
     free(r->in);
@@ -858,18 +885,24 @@ bool ahreader_seek(ahreader *r, uint64_t sample)
         r->left = r->play_total - sample;
     } else if (r->ogg) {
         /* Back to a page a little before; the place is known once a page
-           states it, and the sound up to the target goes. */
+           states it, and the sound up to the target goes. Opus starts 200 ms
+           before the target, for its decoder to settle (RFC 7845 asks for at
+           least 80; CELT's band energies settle by half each 20 ms frame),
+           or from the very start when that is nearer. */
         if (sample > (uint64_t)INT64_MAX / 2) {
             r->ended = true; /* no stream runs that long */
             return false;
         }
-        int64_t target = r->ogg_start + (int64_t)sample;
+        int64_t target = r->ogg_start + (int64_t)sample, aim = target;
         if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
+        else if (r->opus) ahopus_decoder_reset(r->opus);
         else ahflac_decoder_reset(r->flac);
-        if (ahogg_seek(r->ogg, target)) {
+        if (r->opus) aim = target - 9600 < r->ogg_start ? -1 : target - 9600;
+        if (aim >= 0 && ahogg_seek(r->ogg, aim)) {
             r->ogg_lost = true;
             r->ogg_target = target;
         } else {
+            if (aim < 0) ahogg_seek(r->ogg, -1);
             r->ogg_lost = false;
             r->skip = (uint64_t)(target - r->ogg_first);
         }
