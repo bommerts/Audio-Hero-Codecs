@@ -73,6 +73,7 @@ void test_vorbis(void);
 void test_opus(void);
 void test_convert(void);
 void test_reader(void);
+void test_chain(void);
 
 /* Ogg pages, for the Ogg tests (in test_vorbis.c). */
 typedef struct {

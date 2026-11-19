@@ -8,8 +8,14 @@
    or ahopus.h decodes the packets. No dependencies beyond the C standard library, and
    no file access of its own: the caller supplies a function that reads.
 
-   Not handled: a chained file (one stream after another, as recordings of
-   internet radio often are) gives only its first stream. */
+   Chains: a file may hold one stream after another (RFC 3533 calls them
+   chained; internet radio starts a new one for each track, and so do
+   files joined end to end). ahogg_next_stream goes on to the next stream
+   of the same kind, with its own headers; streams of other kinds between
+   are passed over. A file read at random finds its streams by their
+   serial numbers, as RFC 3533 asks them to differ; one read in order
+   (ahogg_open_stream) takes a stream's first page after other pages as a
+   new stream, whatever its number. */
 #ifndef AHOGG_H
 #define AHOGG_H
 
@@ -43,6 +49,11 @@ typedef struct {
                              per channel from the stream's start (Vorbis and
                              FLAC count so; Opus counts at 48 kHz, its
                              pre-skip included); -1 when no page has one */
+    int stream;           /* which stream of a chain this is, 0 for the first:
+                             streams of other kinds are not counted */
+    int streams;          /* how many streams of this kind the file chains
+                             (1 when it is not chained); 0 when it is read in
+                             order and that is not known */
 } ahogg_info;
 
 typedef struct ahogg ahogg;
@@ -52,6 +63,17 @@ typedef struct ahogg ahogg;
    damaged; then
    *error (optional) says why. */
 ahogg *ahogg_open(ahogg_read_fn read, void *user, uint64_t size, const char **error);
+
+/* Opens a stream that can only be read in order, of no known size, such as
+   internet radio. `read` is asked for bytes in order, each offset following
+   on from the bytes it gave before, and never for more than the next page
+   needs; it may give fewer than asked (as they come), and gives 0 only
+   where the stream ends. The stream may be joined anywhere: bytes before
+   the first page are passed over (up to about 128 KB), and so are pages
+   until a stream starts (a new track). Nothing is searched for at the end
+   and there are no seeks: last_granule is -1 and streams is 0. */
+ahogg *ahogg_open_stream(ahogg_read_fn read, void *user, const char **error);
+
 void ahogg_close(ahogg *o);
 const ahogg_info *ahogg_get_info(const ahogg *o);
 
@@ -62,7 +84,8 @@ bool ahogg_header(const ahogg *o, int index, const uint8_t **data, size_t *bytes
 /* The next sound packet. *data and *bytes stay good until the next call.
    *granule is the granule position the page states for the end of this
    packet; only the last packet to end on a page has one, and the others get
-   -1. False at the end of the stream. A page whose checksum fails is left
+   -1. False at the end of the stream (of this stream, in a chain: see
+   ahogg_next_stream). A page whose checksum fails is left
    out, with the packets on it; a packet with a piece missing is dropped. */
 bool ahogg_packet(ahogg *o, const uint8_t **data, size_t *bytes, int64_t *granule);
 
@@ -80,6 +103,21 @@ bool ahogg_last_page(const ahogg *o);
    that needs packets before the target to settle (Opus), aim that much
    earlier. */
 bool ahogg_seek(ahogg *o, int64_t granule);
+/* Opened with ahogg_open_stream, ahogg_seek does nothing and gives false. */
+
+/* Goes on to the next stream of the same kind in a chain, past its
+   headers, so that ahogg_packet hands over its sound packets; what is left
+   of the stream before is passed over. ahogg_get_info and ahogg_header
+   then describe it (stream counts up). False when no such stream follows:
+   the file or stream has ended. */
+bool ahogg_next_stream(ahogg *o);
+
+/* Opened with ahogg_open: moves to stream `index` of the chain (0 for the
+   first), at its first sound packet, as ahogg_next_stream does. False when
+   there is no such stream, its headers are damaged, or the file is read in
+   order; for damaged headers, reading then goes back to the start of the
+   stream it was at, and otherwise nothing changes. */
+bool ahogg_select_stream(ahogg *o, int index);
 
 #ifdef __cplusplus
 }

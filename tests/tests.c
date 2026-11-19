@@ -1182,6 +1182,7 @@ int main(int argc, char **argv)
             if (!strcmp(argv[i + 1], "alac")) test_alac();
             if (!strcmp(argv[i + 1], "vorbis")) test_vorbis();
             if (!strcmp(argv[i + 1], "opus")) test_opus();
+            if (!strcmp(argv[i + 1], "chain")) test_chain();
             printf("%d checks, %d failed\n", g_checks, g_failures);
             return g_failures ? 1 : 0;
         }
@@ -1255,6 +1256,8 @@ int main(int argc, char **argv)
     test_convert();
     printf("one reader for every kind of file\n");
     test_reader();
+    printf("chained Ogg, read at random and in order\n");
+    test_chain();
     printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

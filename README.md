@@ -22,7 +22,7 @@ Around them:
 
 | | Header |
 | --- | --- |
-| One reader for all of the above: tells the kind, decodes, trims, seeks | `ahreader.h` |
+| One reader for all of the above: tells the kind, decodes, trims, seeks; chained Ogg and Ogg radio read in order | `ahreader.h` |
 | Sample rate conversion, any rate to any rate | `ahresample.h` |
 | Mixing 1 to 8 channels to stereo | `ahmix.h` |
 
@@ -131,6 +131,24 @@ to the old name still work.
 - Applies what the pages state: the start of the sound (an encoder's run-in
   to drop, and Opus's pre-skip) and its end; an Opus seek starts 200 ms
   early so the decoder settles (RFC 7845 asks for at least 80 ms)
+- Chains: one stream after another, as internet radio sends a track at a
+  time and as files joined end to end are (RFC 3533). Each stream of the
+  first one's kind plays in turn with a decoder of its own, from its own
+  headers, and is trimmed as it would be alone; streams of other kinds in
+  between are passed over. A file read at random finds its streams by
+  their serial numbers, as RFC 3533 asks them to differ: only when the
+  file's last page belongs to none of the first group's streams does it
+  walk the file's pages to note each link; the reader then gives the
+  length of them all and seeks across them
+- Internet radio, read in order (`ahogg_open_stream`,
+  `ahreader_open_stream`): pages are read as the bytes come, and never more
+  bytes than the next page needs, with no look at the end and no seeks.
+  A listener may join anywhere: bytes up to the next page are passed over,
+  and so are pages until a stream starts, as at a track change. A stream's
+  first page after other pages starts a new stream, whatever its number;
+  so does one that comes without the stream before having been marked
+  ended (a source that stopped). The sound at a stream's start is held
+  until a page says where it lies, and the last page cuts it where it says
 
 **WAV reader**
 - RIFF/WAVE and RF64, plain and extensible headers
@@ -146,6 +164,13 @@ to the old name still work.
 - Drops the run-in and padding of gapless MP3, M4A and Ogg files, so each
   file gives exactly its own sound
 - Says how long the file is, and seeks to the sample
+- Chained Ogg: each read gives the sound of one stream, and the info says
+  which stream (`stream`), with its comments (`ahreader_comment`). A stream
+  whose sample rate, channels or bits differ from the first's ends the
+  sound, as in ffmpeg, so that a caller that made room for the channels it
+  was told at the start is safe; `ahreader_follow_changes` lets the sound go
+  on, the info then describing each read's samples (the caller makes room
+  for 8 channels). Radio is read the same way, in order
 
 **Sample rate converter**
 - Any rate from 1 to 768 kHz to any other, 1 to 8 channels, fed a piece at
@@ -163,7 +188,7 @@ to the old name still work.
 
 ## How it is checked
 
-`tests/` runs about 9,300 checks. With `ffmpeg` on the PATH it also uses
+`tests/` runs about 9,500 checks. With `ffmpeg` on the PATH it also uses
 ffmpeg as an independent reference:
 
 - **Every code of every table.** Each Huffman code of MP3 and of AAC is
@@ -229,6 +254,27 @@ ffmpeg as an independent reference:
   of full scale; near the start, where it decodes from the start, it must
   be exact. Ogg files are also checked with their pages cut
   every way, down to a few bytes, and with other streams mixed in.
+- **Chained Ogg.** Three files each of Vorbis, Opus and FLAC, made by
+  ffmpeg with titles of their own, the second of each with another sample
+  rate or channel count (and for FLAC 24 bits), are each checked against
+  ffmpeg and then joined. Every stream of the joined file must play exactly
+  as its file does alone, with its own rate, channels, bits and title, read
+  at random and in order; without `ahreader_follow_changes` the sound must
+  end at the second file. The length must be the sum, and seeks into each
+  stream must land as in the file alone. In order, the bytes come from a
+  read function that hands out from 1 to 37 bytes, or one, or up to 5,000,
+  and checks it is asked for them in order; the first samples must come
+  before half of the first file has been read. Joined part way (one byte
+  in, mid-page, anywhere in the first file), the second and third files
+  must play exactly; joined in the last, nothing starts; joined as Icecast
+  serves a new listener (the headers, then pages from the middle), the
+  sound must be the end of the first file's (to the bit for Vorbis and
+  FLAC). Also: random bytes in front, a stream of another kind between two,
+  a stream whose end was never marked, a last page that cuts off more than
+  its last packet, changes followed only once the sound has ended at one,
+  a file joined to itself, the Ogg
+  reader's packets read in order against read at random, and damage with
+  and without the checksums made good again.
 - **Sample rate conversion against the mathematics.** A tone resampled is
   the same tone at the new rate. For 18 pairs of rates, tones across the
   kept band must come out within 94 dB of that ideal (a level error under
@@ -347,6 +393,23 @@ rate.
 - **Mono to stereo.** ffmpeg plays a one-channel file 3 dB down on each
   side. The mix here puts it on both sides as it is, so a mono file is no
   quieter than a stereo one.
+
+- **Chained Ogg.** ffmpeg stops where a chained stream's sample rate or
+  channels change ("not yet implemented"). This reader goes on when asked
+  (`ahreader_follow_changes`) and otherwise ends there too. Where the shape
+  stays the same, ffmpeg goes on but does not start the new stream as a
+  file of its own: it plays the first, half-made block of each later
+  Vorbis stream (576 extra samples with libvorbis's usual block sizes),
+  which the specification says gives no sound, and it misplaces the start
+  of later Opus and FLAC streams. This reader plays each stream exactly as
+  its file alone, which is how the tests check it.
+- **A file joined to itself.** When a chain's streams share a serial
+  number, which RFC 3533 forbids (a file joined to itself, or files written
+  with ffmpeg's `-fflags +bitexact`), ffmpeg plays on into the second. Read
+  at random, this reader tells streams apart by their numbers (as
+  libvorbisfile does), so it plays only the first: telling such a join
+  apart would mean reading the whole file at opening. Read in order, it
+  plays both.
 
 Apart from short Ogg Vorbis files and Opus switches into CELT without a
 redundant frame, encoders in common use write none of these, so files play
@@ -490,6 +553,28 @@ while ((made = ahresample_flush(rs, out, 1024)) != 0) { /* the last of it */ }
 ahreader_seek(r, 30 * (uint64_t)info->sample_rate); /* to 0:30 */
 ```
 
+Internet radio in Ogg, read in order as the bytes come, track after track:
+
+```c
+/* my_network_read blocks until some bytes come and returns how many (as
+   many as asked, or fewer); 0 when the stream has ended. */
+ahreader *r = ahreader_open_stream(my_network_read, my_connection, &error);
+ahreader_follow_changes(r, true); /* tracks may differ in rate or channels */
+float pcm[AHREADER_MAX_CHANNELS * 1024];
+int stream = -1;
+size_t n;
+while ((n = ahreader_read(r, pcm, 1024)) != 0) {
+    const ahreader_info *info = ahreader_get_info(r);
+    if (info->stream != stream) {
+        stream = info->stream; /* a new track: its rate, channels and title */
+        const char *text;
+        size_t bytes;
+        for (int i = 0; ahreader_comment(r, i, &text, &bytes); i++) { /* "TITLE=..." */ }
+    }
+    /* n samples per channel, at info->sample_rate, info->channels each */
+}
+```
+
 Each header documents its whole interface: [ahmp3.h](include/ahmp3.h),
 [ahflac.h](include/ahflac.h), [ahaac.h](include/ahaac.h),
 [ahalac.h](include/ahalac.h), [ahm4a.h](include/ahm4a.h),
@@ -554,8 +639,10 @@ take just the files you need:
   ffmpeg reads up to about 16 million, but a decoder holding that much
   would not be small.
 - The MD5 check of a whole FLAC file.
-- Chained Ogg files (one stream after another, as recordings of internet
-  radio often are) give only their first stream.
+- Read in order, only Ogg: MP3 and AAC radio is not read this way yet.
+- Comments are given for Ogg files only.
+- A chained Ogg stream of another kind than the first (Vorbis, then Opus)
+  is passed over, not played.
 - The other codecs an Ogg file may hold (Speex, Theora video).
 - Opus with more than 8 channels, and Opus mapping families other than 0
   and 1 (family 255, channels with no stated speaker, and the ambisonics

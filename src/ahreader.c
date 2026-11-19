@@ -21,7 +21,24 @@ enum {
     SCAN = 1 << 16,       /* bytes read at a time when walking frame headers */
     JUNK_MAX = 1 << 22,   /* bytes that may come before the first frame */
     M4A_PACKET_MAX = 1 << 14, /* bytes of the biggest M4A packet read (AAC allows 768 per channel) */
+    OGG_HOLD_MAX = 1 << 18,   /* samples held, read in order, until a page says where they lie */
 };
+
+/* The shape of the sound of one Ogg stream. */
+typedef struct {
+    int rate, channels, bits;
+    uint32_t mask;
+} ogg_shape;
+
+/* One stream of a chained Ogg file read at random. */
+typedef struct {
+    bool ok;         /* it can be played */
+    ogg_shape shape;
+    int64_t first;   /* where the first sound decoded from its start lies */
+    int64_t start;   /* where the sound played starts */
+    uint64_t play;   /* samples it plays; UINT64_MAX when not known */
+    uint64_t before; /* samples of the streams played before it */
+} ogg_stream;
 
 struct ahreader {
     ahreader_read_fn read;
@@ -58,6 +75,23 @@ struct ahreader {
     int64_t ogg_start;  /* where the sound played starts */
     int64_t ogg_target; /* where a seek is to land */
     int64_t opus_pre_skip; /* Opus: samples the header says to drop at the start */
+    bool in_order;      /* opened with ahreader_open_stream */
+    bool follow;        /* ahreader_follow_changes */
+    bool ogg_changed;   /* the decoder is at a stream the info does not
+                           describe yet: it does from the next read on */
+    bool ogg_over;      /* no further stream of a chain is to be played */
+    bool ogg_waiting;   /* the sound ended at a stream of another shape;
+                           ahreader_follow_changes lets it go on */
+    ogg_shape dec;      /* the sound the decoder gives */
+    size_t ogg_packet_max; /* samples per channel in the biggest packet */
+    int64_t ogg_place;  /* in order: the granule position at the end of the
+                           sound decoded; -1 until a page states one */
+    size_t ogg_held;    /* in order: samples decoded before then, kept in
+                           pcm after pcm_len */
+    ogg_stream *streams; /* read at random: the chain's streams */
+    int nstreams, nfollowed, ogg_cur;
+    uint8_t *comments;  /* the comment header of the stream shown */
+    size_t comments_bytes;
     int32_t *ints;       /* FLAC's and ALAC's whole numbers */
     uint8_t *packet;     /* one M4A packet */
     size_t packet_cap;
@@ -179,34 +213,122 @@ static bool decode_packet(ahreader *r)
 }
 
 /* Decodes one FLAC frame that came as an Ogg packet. Returns the samples
-   per channel it gave, as floats at `at`. */
-static size_t ogg_flac_frame(ahreader *r, const uint8_t *data, size_t bytes, float *at)
+   per channel it gave, as floats at `at`, which has room for `room`. */
+static size_t ogg_flac_frame(ahreader *r, const uint8_t *data, size_t bytes, float *at, size_t room)
 {
-    size_t channels = (size_t)r->info.channels, total = 0, pos = 0, cap = r->pcm_cap * channels;
+    size_t channels = (size_t)r->dec.channels, total = 0, pos = 0;
+    if (room > r->ogg_packet_max) room = r->ogg_packet_max; /* what ints holds */
     for (;;) {
         int n = 0;
-        size_t used = ahflac_decode(r->flac, data + pos, bytes - pos, true, r->ints + total * channels, cap - total * channels, &n, NULL);
+        size_t used = ahflac_decode(r->flac, data + pos, bytes - pos, true, r->ints + total * channels, (room - total) * channels, &n, NULL);
         pos += used;
         total += (size_t)n;
-        if ((!used && !n) || total == r->pcm_cap) break;
+        if ((!used && !n) || total == room) break;
     }
-    ahflac_to_float(r->ints, at, total * channels, r->info.bits);
+    ahflac_to_float(r->ints, at, total * channels, r->dec.bits);
     return total;
 }
 
+/* Where the first sound decoded from an Ogg stream's start lies: what is
+   decoded up to the first page that states a place (`granule`, from a page
+   that `last` says ends the stream), `got` samples, ends there. A stream
+   whose first such page is also its last states only where it ends; Opus
+   then still works back from it when it states more than it holds (RFC
+   7845 section 4.5). No such page: 0. */
+static int64_t ogg_first_place(bool opus, int64_t granule, int64_t got, bool last)
+{
+    if (granule < 0) return 0;
+    if (!last || (opus && granule > got)) return granule - got;
+    return 0;
+}
+
+/* Where the sound played starts: not before 0, and for Opus past the
+   header's pre-skip. */
+static int64_t ogg_start_place(int64_t first, bool opus, int64_t pre_skip)
+{
+    int64_t start = first > 0 ? first : 0;
+    if (opus && first + pre_skip > start) start = first + pre_skip;
+    return start;
+}
+
+/* In order: room in pcm for one more packet after those held. False when
+   no more may be held. */
+static bool ogg_room(ahreader *r)
+{
+    size_t need = r->pcm_len + r->ogg_held + r->ogg_packet_max;
+    if (need <= r->pcm_cap) return true;
+    if (r->ogg_held >= OGG_HOLD_MAX) return false;
+    size_t cap = r->pcm_cap * 2 > need ? r->pcm_cap * 2 : need;
+    float *grown = realloc(r->pcm, cap * (size_t)r->dec.channels * sizeof(float));
+    if (!grown) return false;
+    r->pcm = grown;
+    r->pcm_cap = cap;
+    return true;
+}
+
+/* In order: where the sound held lies is now known from a page (granule;
+   `last`: the stream's last page), or never will be (-1). What lies before
+   the start goes, and after the end; the rest is let out. */
+static void ogg_settle(ahreader *r, int64_t granule, bool last)
+{
+    bool opus = r->opus != NULL;
+    int64_t got = (int64_t)r->ogg_held;
+    int64_t first = ogg_first_place(opus, granule, got, last);
+    int64_t start = ogg_start_place(first, opus, r->opus_pre_skip);
+    int64_t end = first + got;
+    if (granule >= 0 && last && granule < end) end = granule;
+    int64_t from = start - first, to = end - first;
+    size_t channels = (size_t)r->dec.channels;
+    if (from < to) {
+        size_t kept = (size_t)(to - from);
+        memmove(r->pcm + r->pcm_len * channels, r->pcm + (r->pcm_len + (size_t)from) * channels, kept * channels * sizeof(float));
+        r->pcm_len += kept;
+    }
+    if (from > got) r->skip = (uint64_t)(from - got); /* the start lies further on */
+    r->ogg_held = 0;
+    r->ogg_place = granule >= 0 ? granule : first + got;
+}
+
+/* In order: lets out the first `keep` of the samples held from a stream's
+   last page; the rest go. */
+static void ogg_let_out(ahreader *r, size_t keep)
+{
+    size_t held = r->ogg_held;
+    r->ogg_held = 0;
+    append(r, keep < held ? keep : held);
+}
+
 /* Decodes the next packet of an Ogg file. After a seek the place of the
-   sound is not known until a page states it; what comes before goes. */
+   sound is not known until a page states it; what comes before goes. Read
+   in order, the sound at a stream's start is held until a page says where
+   it lies, and the stream's last page says where it ends. */
 static bool decode_ogg(ahreader *r)
 {
     const uint8_t *data;
     size_t bytes;
     int64_t granule;
-    if (!ahogg_packet(r->ogg, &data, &bytes, &granule)) return false;
-    float *at = r->pcm + r->pcm_len * (size_t)r->info.channels;
+    size_t channels = (size_t)r->dec.channels;
+    bool holding = r->in_order && r->ogg_place < 0;
+    if (r->in_order && r->ogg_held && !ogg_room(r)) {
+        if (holding) ogg_settle(r, -1, false);
+        else ogg_let_out(r, r->ogg_held);
+        return true;
+    }
+    if (!ahogg_packet(r->ogg, &data, &bytes, &granule)) {
+        /* A stream that ends before a page says where its sound lies or
+           ends plays what was held. */
+        if (r->in_order && r->ogg_held) {
+            if (holding) ogg_settle(r, -1, false);
+            else ogg_let_out(r, r->ogg_held);
+            return true;
+        }
+        return false;
+    }
+    float *at = r->pcm + (r->pcm_len + r->ogg_held) * channels;
     int n = 0;
     if (r->vorbis) ahvorbis_decode_packet(r->vorbis, data, bytes, at, &n);
     else if (r->opus) ahopus_decode_packet(r->opus, data, bytes, at, &n);
-    else n = (int)ogg_flac_frame(r, data, bytes, at);
+    else n = (int)ogg_flac_frame(r, data, bytes, at, r->pcm_cap - r->pcm_len - r->ogg_held);
     if (r->ogg_lost) {
         if (granule >= 0) {
             r->ogg_lost = false;
@@ -214,6 +336,27 @@ static bool decode_ogg(ahreader *r)
         }
         return true;
     }
+    if (!r->in_order) {
+        append(r, (size_t)n);
+        return true;
+    }
+    bool last = ahogg_last_page(r->ogg);
+    if (holding) {
+        r->ogg_held += (size_t)n;
+        if (granule >= 0) ogg_settle(r, granule, last);
+        return true;
+    }
+    if (last) {
+        /* The stream's last page: its packets are held until the one that
+           says where the sound ends, which may cut more than one. */
+        r->ogg_held += (size_t)n;
+        if (granule < 0) return true;
+        int64_t keep = granule - r->ogg_place;
+        r->ogg_place = granule;
+        ogg_let_out(r, keep > 0 ? (size_t)keep : 0);
+        return true;
+    }
+    r->ogg_place = granule >= 0 ? granule : r->ogg_place + n;
     append(r, (size_t)n);
     return true;
 }
@@ -427,18 +570,20 @@ static const char *open_m4a(ahreader *r)
     return NULL;
 }
 
-/* Vorbis, FLAC or Opus in an Ogg file. The pages state where the sound
-   ends; the first page that states a place also tells where the sound
-   starts: the sound decoded up to it ends there. Opus drops the header's
-   pre-skip as well (RFC 7845). */
-static const char *open_ogg(ahreader *r)
+/* Sets up a new decoder for the stream the Ogg reader is at, from its
+   headers, and room for its sound. Returns what went wrong, or NULL. */
+static const char *ogg_decoder(ahreader *r, ogg_shape *s)
 {
-    const char *error = NULL;
-    r->ogg = ahogg_open(m4a_read, r, r->size - r->base, &error);
-    if (!r->ogg) return error ? error : "not an Ogg file that can be read";
+    ahvorbis_decoder_free(r->vorbis);
+    ahopus_decoder_free(r->opus);
+    ahflac_decoder_free(r->flac);
+    r->vorbis = NULL;
+    r->opus = NULL;
+    r->flac = NULL;
+    memset(s, 0, sizeof(*s));
     const ahogg_info *oi = ahogg_get_info(r->ogg);
     const uint8_t *data;
-    size_t bytes;
+    size_t bytes, most;
     if (oi->codec == AHOGG_VORBIS) {
         r->vorbis = ahvorbis_decoder_new();
         if (!r->vorbis) return "out of memory";
@@ -448,12 +593,8 @@ static const char *open_ogg(ahreader *r)
                 const char *why = ahvorbis_decoder_error(r->vorbis);
                 return why ? why : "the Vorbis headers are damaged";
             }
-        r->info.kind = AHREADER_VORBIS;
-        r->info.name = "Vorbis";
-        r->info.sample_rate = f.sample_rate;
-        r->info.channels = f.channels;
-        r->info.channel_mask = f.channel_mask;
-        r->pcm_cap = 2 * AHVORBIS_MAX_SAMPLES;
+        *s = (ogg_shape){f.sample_rate, f.channels, 0, f.channel_mask};
+        most = AHVORBIS_MAX_SAMPLES;
     } else if (oi->codec == AHOGG_OPUS) {
         r->opus = ahopus_decoder_new();
         if (!r->opus) return "out of memory";
@@ -462,13 +603,9 @@ static const char *open_ogg(ahreader *r)
             const char *why = ahopus_decoder_error(r->opus);
             return why ? why : "the Opus header is damaged";
         }
-        r->info.kind = AHREADER_OPUS;
-        r->info.name = "Opus";
-        r->info.sample_rate = f.sample_rate;
-        r->info.channels = f.channels;
-        r->info.channel_mask = f.channel_mask;
+        *s = (ogg_shape){f.sample_rate, f.channels, 0, f.channel_mask};
         r->opus_pre_skip = f.pre_skip;
-        r->pcm_cap = 2 * AHOPUS_MAX_SAMPLES;
+        most = AHOPUS_MAX_SAMPLES;
     } else {
         /* The first packet carries FLAC's own stream information block: hand
            the decoder that, as a FLAC file would start. */
@@ -484,22 +621,41 @@ static const char *open_ogg(ahreader *r)
             used = ahflac_decode(r->flac, head + pos, sizeof(head) - pos, false, NULL, 0, &n, &f);
             pos += used;
         } while (used && pos < sizeof(head));
-        if (ahflac_decoder_error(r->flac) || !f.sample_rate) return "the Ogg FLAC headers are damaged";
-        r->info.kind = AHREADER_OGG_FLAC;
-        r->info.name = "Ogg FLAC";
-        r->info.sample_rate = f.sample_rate;
-        r->info.channels = f.channels;
-        r->info.bits = f.bits;
-        r->pcm_cap = (size_t)f.max_block;
-        r->ints = malloc(r->pcm_cap * (size_t)f.channels * sizeof(int32_t));
-        if (!r->ints) return "out of memory";
+        if (ahflac_decoder_error(r->flac) || !f.sample_rate || f.max_block <= 0) return "the Ogg FLAC headers are damaged";
+        *s = (ogg_shape){f.sample_rate, f.channels, f.bits, 0};
+        most = (size_t)f.max_block;
     }
-    r->pcm = malloc(r->pcm_cap * (size_t)r->info.channels * sizeof(float));
-    if (!r->pcm) return "out of memory";
+    if (s->rate <= 0 || s->channels <= 0) return "the Ogg file holds no sound";
+    size_t channels = (size_t)s->channels;
+    float *pcm = realloc(r->pcm, 2 * most * channels * sizeof(float));
+    if (!pcm) return "out of memory";
+    r->pcm = pcm;
+    r->pcm_cap = 2 * most;
+    if (r->flac) {
+        int32_t *ints = realloc(r->ints, most * channels * sizeof(int32_t));
+        if (!ints) return "out of memory";
+        r->ints = ints;
+    }
+    r->ogg_packet_max = most;
+    r->dec = *s;
+    return NULL;
+}
 
-    /* Where the sound starts: what is decoded before the first page that
-       states a place ends at that place. A stream whose first such page is
-       also its last states only where it ends. */
+static void ogg_reset_decoder(ahreader *r)
+{
+    if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
+    else if (r->opus) ahopus_decoder_reset(r->opus);
+    else if (r->flac) ahflac_decoder_reset(r->flac);
+}
+
+/* Read at random: where the sound of the stream the Ogg reader is at
+   starts, and how much it plays. Leaves the reader at its first sound
+   packet. False when it holds no sound that can be decoded. */
+static bool ogg_measure(ahreader *r, ogg_stream *st)
+{
+    const ahogg_info *oi = ahogg_get_info(r->ogg);
+    const uint8_t *data;
+    size_t bytes;
     int64_t got = 0, granule = -1;
     bool any = false, last = false;
     for (int packets = 0; packets < 100000 && granule < 0; packets++) {
@@ -508,31 +664,164 @@ static const char *open_ogg(ahreader *r)
         int n = 0;
         if (r->vorbis) any |= ahvorbis_decode_packet(r->vorbis, data, bytes, r->pcm, &n);
         else if (r->opus) any |= ahopus_decode_packet(r->opus, data, bytes, r->pcm, &n);
-        else n = (int)ogg_flac_frame(r, data, bytes, r->pcm);
+        else n = (int)ogg_flac_frame(r, data, bytes, r->pcm, r->pcm_cap);
         got += n;
         any |= n > 0;
     }
-    if (!any) return "the Ogg file holds no sound that could be decoded";
-    r->ogg_first = granule >= 0 && !last ? granule - got : 0;
-    /* Opus: a stream on one page that states more than it holds still
-       works backwards from its end (RFC 7845 section 4.5). */
-    if (r->opus && last && granule > got) r->ogg_first = granule - got;
-    r->ogg_start = r->ogg_first > 0 ? r->ogg_first : 0;
-    if (r->opus && r->ogg_first + r->opus_pre_skip > r->ogg_start) r->ogg_start = r->ogg_first + r->opus_pre_skip;
-    if (oi->last_granule >= 0) {
-        r->play_total = oi->last_granule > r->ogg_start ? (uint64_t)(oi->last_granule - r->ogg_start) : 0;
-        r->left = r->play_total;
-        r->info.samples = r->play_total;
-        r->info.samples_exact = true;
-    } else {
-        r->play_total = UINT64_MAX;
-    }
+    if (!any) return false;
+    bool opus = r->opus != NULL;
+    st->first = ogg_first_place(opus, granule, got, last);
+    st->start = ogg_start_place(st->first, opus, r->opus_pre_skip);
+    st->play = UINT64_MAX;
+    if (oi->last_granule >= 0) st->play = oi->last_granule > st->start ? (uint64_t)(oi->last_granule - st->start) : 0;
     /* And back to the start. */
     ahogg_seek(r->ogg, -1);
-    if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
-    else if (r->opus) ahopus_decoder_reset(r->opus);
-    else ahflac_decoder_reset(r->flac);
-    r->skip = (uint64_t)(r->ogg_start - r->ogg_first);
+    ogg_reset_decoder(r);
+    return true;
+}
+
+/* Read at random: the streams played, and the length of them all. Without
+   ahreader_follow_changes the sound ends where a stream of another shape
+   starts. */
+static void ogg_totals(ahreader *r)
+{
+    const ogg_shape *a = &r->streams[0].shape;
+    uint64_t total = 0;
+    bool known = true;
+    r->nfollowed = r->nstreams;
+    for (int k = 0; k < r->nstreams; k++) {
+        ogg_stream *st = &r->streams[k];
+        st->before = total;
+        if (!st->ok) continue;
+        const ogg_shape *b = &st->shape;
+        if (!r->follow && (a->rate != b->rate || a->channels != b->channels || a->bits != b->bits || a->mask != b->mask)) {
+            r->nfollowed = k;
+            break;
+        }
+        if (st->play == UINT64_MAX) known = false;
+        else total += st->play;
+    }
+    r->info.samples = known ? total : 0;
+    r->info.samples_exact = known;
+}
+
+/* Read at random: plays stream k from its start. */
+static void ogg_begin(ahreader *r, int k)
+{
+    const ogg_stream *st = &r->streams[k];
+    r->ogg_cur = k;
+    r->ogg_first = st->first;
+    r->ogg_start = st->start;
+    r->play_total = st->play;
+    r->left = st->play;
+    r->skip = (uint64_t)(st->start - st->first);
+    r->ogg_lost = false;
+}
+
+/* The info describes the stream the decoder is at, from now on. */
+static void ogg_show(ahreader *r)
+{
+    const ahogg_info *oi = ahogg_get_info(r->ogg);
+    r->info.kind = oi->codec == AHOGG_VORBIS ? AHREADER_VORBIS : oi->codec == AHOGG_OPUS ? AHREADER_OPUS : AHREADER_OGG_FLAC;
+    r->info.name = oi->codec == AHOGG_VORBIS ? "Vorbis" : oi->codec == AHOGG_OPUS ? "Opus" : "Ogg FLAC";
+    r->info.sample_rate = r->dec.rate;
+    r->info.channels = r->dec.channels;
+    r->info.channel_mask = r->dec.mask;
+    r->info.bits = r->dec.bits;
+    r->info.stream = oi->stream;
+    /* The comments: Vorbis's and Opus's second header; for FLAC the block
+       of them, which the mapping puts right after the first packet. */
+    free(r->comments);
+    r->comments = NULL;
+    r->comments_bytes = 0;
+    const uint8_t *data;
+    size_t bytes;
+    for (int i = 1; i < 3; i++) {
+        if (!ahogg_header(r->ogg, i, &data, &bytes)) break;
+        if (oi->codec == AHOGG_FLAC && (!bytes || (data[0] & 0x7F) != 4)) continue;
+        r->comments = malloc(bytes ? bytes : 1);
+        if (r->comments) {
+            memcpy(r->comments, data, bytes);
+            r->comments_bytes = bytes;
+        }
+        break;
+    }
+    r->ogg_changed = false;
+}
+
+/* The stream played has ended: sets up the next one of the chain to play.
+   False when there is none. */
+static bool ogg_next(ahreader *r)
+{
+    if (r->ogg_over) return false;
+    bool moved = false;
+    if (r->in_order) {
+        while (!moved) {
+            /* Waiting, the decoder is at that stream already. */
+            if (!r->ogg_waiting) {
+                if (!ahogg_next_stream(r->ogg)) break;
+                ogg_shape s;
+                if (ogg_decoder(r, &s)) continue; /* damaged: on to the next */
+            }
+            const ogg_shape *s = &r->dec;
+            r->ogg_waiting = !r->follow && (s->rate != r->info.sample_rate || s->channels != r->info.channels ||
+                                            s->bits != r->info.bits || s->mask != r->info.channel_mask);
+            if (r->ogg_waiting) break;
+            r->ogg_place = -1;
+            r->ogg_held = 0;
+            r->skip = 0;
+            r->left = UINT64_MAX;
+            moved = true;
+        }
+    } else {
+        for (int k = r->ogg_cur + 1; k < r->nfollowed && !moved; k++) {
+            ogg_shape s;
+            if (!r->streams[k].ok || !ahogg_select_stream(r->ogg, k)) continue;
+            if (ogg_decoder(r, &s)) {
+                r->ogg_cur = -1; /* no stream's decoder is in hand */
+                continue;
+            }
+            ogg_begin(r, k);
+            moved = true;
+        }
+        r->ogg_waiting = !moved && r->nfollowed < r->nstreams;
+    }
+    if (!moved) {
+        r->ogg_over = true;
+        return false;
+    }
+    r->pcm_len = r->pcm_pos = 0;
+    r->ended = false;
+    r->ogg_changed = true;
+    return true;
+}
+
+/* Vorbis, FLAC or Opus in an Ogg file. The pages state where the sound
+   ends; the first page that states a place also tells where the sound
+   starts: the sound decoded up to it ends there. Opus drops the header's
+   pre-skip as well (RFC 7845). Each stream of a chain is measured so. */
+static const char *open_ogg(ahreader *r)
+{
+    const char *error = NULL;
+    r->ogg = ahogg_open(m4a_read, r, r->size - r->base, &error);
+    if (!r->ogg) return error ? error : "not an Ogg file that can be read";
+    int n = ahogg_get_info(r->ogg)->streams;
+    r->streams = calloc((size_t)n, sizeof(ogg_stream));
+    if (!r->streams) return "out of memory";
+    r->nstreams = n;
+    for (int k = 0; k < n; k++) {
+        ogg_stream *st = &r->streams[k];
+        if (k && !ahogg_select_stream(r->ogg, k)) continue;
+        const char *why = ogg_decoder(r, &st->shape);
+        if (!why && !ogg_measure(r, st)) why = "the Ogg file holds no sound that could be decoded";
+        if (why && !k) return why;
+        st->ok = !why;
+    }
+    ogg_shape s;
+    if (n > 1 && (!ahogg_select_stream(r->ogg, 0) || ogg_decoder(r, &s))) return "the Ogg file cannot be read again";
+    ogg_show(r);
+    ogg_totals(r);
+    ogg_begin(r, 0);
     return NULL;
 }
 
@@ -752,6 +1041,78 @@ ahreader *ahreader_open(ahreader_read_fn read, void *user, uint64_t size, const 
     return r;
 }
 
+ahreader *ahreader_open_stream(ahreader_read_fn read, void *user, const char **error)
+{
+    const char *why = NULL;
+    ahreader *r = calloc(1, sizeof(*r));
+    if (error) *error = NULL;
+    if (!r) {
+        if (error) *error = "out of memory";
+        return NULL;
+    }
+    r->read = read;
+    r->user = user;
+    r->size = UINT64_MAX;
+    r->left = UINT64_MAX;
+    r->junk_left = UINT64_MAX;
+    r->in_order = true;
+    r->ogg_place = -1;
+    r->ogg = ahogg_open_stream(m4a_read, r, &why);
+    if (!r->ogg) {
+        if (!why) why = "not an Ogg stream that can be read";
+    } else {
+        /* A stream whose headers the decoder refuses is passed over. */
+        ogg_shape s;
+        while ((why = ogg_decoder(r, &s)) != NULL && ahogg_next_stream(r->ogg)) {}
+        if (!why) ogg_show(r);
+    }
+    if (why) {
+        if (error) *error = why;
+        ahreader_close(r);
+        return NULL;
+    }
+    return r;
+}
+
+void ahreader_follow_changes(ahreader *r, bool follow)
+{
+    r->follow = follow;
+    if (r->ogg && !r->in_order) ogg_totals(r);
+    if (follow && r->ogg_waiting) r->ogg_over = false; /* it goes on */
+}
+
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+bool ahreader_comment(const ahreader *r, int index, const char **text, size_t *bytes)
+{
+    const uint8_t *p = r->comments;
+    size_t n = r->comments_bytes, at;
+    if (!p || index < 0) return false;
+    if (n >= 7 && !memcmp(p, "\x03vorbis", 7)) at = 7;
+    else if (n >= 8 && !memcmp(p, "OpusTags", 8)) at = 8;
+    else if (n >= 4 && (p[0] & 0x7F) == 4) at = 4; /* FLAC's block of comments */
+    else return false;
+    /* The vendor's name, then the comments, each with its length first. */
+    if (n - at < 4 || le32(p + at) > n - at - 4) return false;
+    at += 4 + le32(p + at);
+    if (n - at < 4) return false;
+    uint32_t count = le32(p + at);
+    at += 4;
+    for (uint32_t i = 0; i < count; i++) {
+        if (n - at < 4) return false;
+        uint32_t len = le32(p + at);
+        at += 4;
+        if (len > n - at) return false;
+        if (i == (uint32_t)index) {
+            *text = (const char *)(p + at);
+            *bytes = len;
+            return true;
+        }
+        at += len;
+    }
+    return false;
+}
+
 void ahreader_close(ahreader *r)
 {
     if (!r) return;
@@ -769,6 +1130,8 @@ void ahreader_close(ahreader *r)
     free(r->ints);
     free(r->packet);
     free(r->scan);
+    free(r->streams);
+    free(r->comments);
     free(r);
 }
 
@@ -779,7 +1142,8 @@ const ahreader_info *ahreader_get_info(const ahreader *r)
 
 /* ---- reading ---------------------------------------------------------------------- */
 
-size_t ahreader_read(ahreader *r, float *pcm, size_t max_frames)
+/* Gives what the stream in hand has, as ahreader_read does. */
+static size_t read_stream(ahreader *r, float *pcm, size_t max_frames)
 {
     size_t given = 0, channels = (size_t)r->info.channels;
     while (given < max_frames && r->left) {
@@ -804,6 +1168,17 @@ size_t ahreader_read(ahreader *r, float *pcm, size_t max_frames)
         if (r->left != UINT64_MAX) r->left -= n;
     }
     return given;
+}
+
+size_t ahreader_read(ahreader *r, float *pcm, size_t max_frames)
+{
+    if (!max_frames) return 0;
+    for (;;) {
+        /* A read gives the sound of one stream of a chain only. */
+        if (r->ogg_changed) ogg_show(r);
+        size_t given = read_stream(r, pcm, max_frames);
+        if (given || !r->ogg || !ogg_next(r)) return given;
+    }
 }
 
 /* ---- seeking ---------------------------------------------------------------------- */
@@ -861,11 +1236,13 @@ static void flac_seek(ahreader *r, uint64_t sample)
 
 bool ahreader_seek(ahreader *r, uint64_t sample)
 {
+    if (r->in_order) return false; /* reading goes on */
     r->pcm_len = r->pcm_pos = 0;
     r->skip = 0;
     r->ended = false;
+    r->ogg_over = r->ogg_waiting = false;
     if (r->info.samples_exact && sample >= r->info.samples) {
-        r->ended = true;
+        r->ended = r->ogg_over = true;
         return false;
     }
     if (r->wav) {
@@ -891,14 +1268,27 @@ bool ahreader_seek(ahreader *r, uint64_t sample)
            before the target, for its decoder to settle (RFC 7845 asks for at
            least 80; CELT's band energies settle by half each 20 ms frame),
            or from the very start when that is nearer. */
-        if (sample > (uint64_t)INT64_MAX / 2) {
-            r->ended = true; /* no stream runs that long */
+        /* First the stream of the chain it lies in. */
+        int k = -1;
+        for (int i = 0; i < r->nfollowed && k < 0 && sample <= (uint64_t)INT64_MAX / 2; i++) {
+            const ogg_stream *st = &r->streams[i];
+            if (st->ok && (st->play == UINT64_MAX || sample < st->before + st->play)) k = i;
+        }
+        ogg_shape s;
+        bool moved = k >= 0 && k != r->ogg_cur && ahogg_select_stream(r->ogg, k);
+        if (moved && ogg_decoder(r, &s)) {
+            r->ogg_cur = -1; /* no stream's decoder is in hand */
+            moved = false;
+        }
+        if (k < 0 || (k != r->ogg_cur && !moved)) {
+            r->ended = r->ogg_over = true; /* no stream runs that long */
             return false;
         }
+        ogg_begin(r, k);
+        r->ogg_changed = ahogg_get_info(r->ogg)->stream != r->info.stream;
+        sample -= r->streams[k].before;
         int64_t target = r->ogg_start + (int64_t)sample, aim = target;
-        if (r->vorbis) ahvorbis_decoder_reset(r->vorbis);
-        else if (r->opus) ahopus_decoder_reset(r->opus);
-        else ahflac_decoder_reset(r->flac);
+        ogg_reset_decoder(r);
         if (r->opus) aim = target - 9600 < r->ogg_start ? -1 : target - 9600;
         if (aim >= 0 && ahogg_seek(r->ogg, aim)) {
             r->ogg_lost = true;

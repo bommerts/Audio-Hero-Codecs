@@ -61,7 +61,8 @@ add_executable(ahmp3_tests
   tests/test_vorbis.c
   tests/test_opus.c
   tests/test_convert.c
-  tests/test_reader.c)
+  tests/test_reader.c
+  tests/test_chain.c)
 target_link_libraries(ahmp3_tests ahcodecs)
 # Small files kept in the repository: HE-AAC made by Windows' AAC encoder.
 target_compile_definitions(ahmp3_tests PRIVATE AHMP3_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
