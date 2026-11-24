@@ -1733,7 +1733,7 @@ static void test_bad_floor_book(void)
 {
     int bad = 0, good = 0;
     static float pcm[8 * AHVORBIS_MAX_SAMPLES];
-    for (int round = 0; round < 60 && bad < 20; round++) {
+    for (int round = 0; round < 60 && (bad < 20 || !good); round++) {
         wsetup s;
         random_setup(&s);
         bytes file = {0};

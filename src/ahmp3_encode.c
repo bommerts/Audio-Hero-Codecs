@@ -1,11 +1,13 @@
 /* Layer III encoder: polyphase analysis, MDCT with block switching, a
    masking model, rate/distortion loops, Huffman coding and the bit
-   reservoir. Constant bit rate. */
+   reservoir. Constant and variable bit rate. */
 #include "ahmp3_internal.h"
 #include "ahmp3_bitstream.h"
 
 #define MAX_PENDING 32
 #define FIFO_BYTES 16384
+#define STEP_OFF 400
+#define STEP_TAB 512
 
 /* One granule of one channel waiting to be coded: its 18 x 32 subband
    samples and what the attack detector saw. */
@@ -32,15 +34,26 @@ struct ahmp3_encoder {
     float cutoff;           /* lowpass, as a fraction of the band */
 
     /* input and analysis */
-    float X[2][512];        /* polyphase input history */
-    float analysis[32][64]; /* cos((2k + 1)(i - 16) pi / 64) */
+    float X[2][512];        /* polyphase input history ring buffer */
+    int X_pos[2];           /* current ring write offset in X */
     float in[2][576];
     int in_len;
     granule_in queue[4][2]; /* previous, frame granules, lookahead */
     int queued;
     int prev_block;         /* block type of the last coded granule */
-    float mdct_cos_long[18][36];
+
+    /* fast transform tables */
+    float inv2cos32[16];
+    float inv2cos16[8];
+    float inv2cos8[4];
+    float inv2cos4[2];
+    float mdct18_a[18][9];  /* folded MDCT weights for a[r] = z[8-r] - z[9+r] */
+    float mdct18_b[18][9];  /* folded MDCT weights for b[r] = z[26-r] + z[27+r] */
     float mdct_cos_short[6][12];
+
+    /* quantization step lookup tables */
+    float pow2_q[STEP_TAB]; /* 2^(-3 * step / 16) */
+    float pow2_r[STEP_TAB]; /* 2^(step / 4) */
 
     /* masking model */
     float ath_long[22], ath_short[13];
@@ -67,6 +80,30 @@ struct ahmp3_encoder {
     uint64_t seek[256];     /* byte offset of every seek_stride-th frame */
     int seek_count, seek_stride;
 };
+
+static inline float fast_log2f(float x)
+{
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    float e = (float)((int32_t)(u >> 23) - 127);
+    uint32_t mu = (u & 0x007FFFFFu) | 0x3F800000u;
+    float m;
+    memcpy(&m, &mu, sizeof(m));
+    return e + (-0.34484843f * m + 2.02466578f) * m - 1.67487759f;
+}
+
+static inline float fast_pow2f(float x)
+{
+    if (x < -126.0f) return 0.0f;
+    if (x > 126.0f) x = 126.0f;
+    int i = (int)floorf(x);
+    float f = x - (float)i;
+    float p = ((0.0558011f * f + 0.2402265f) * f + 0.6931472f) * f + 1.0f;
+    uint32_t u = (uint32_t)(i + 127) << 23;
+    float scale;
+    memcpy(&scale, &u, sizeof(scale));
+    return p * scale;
+}
 
 /* CRC-16 with the reflected polynomial 0xA001, as the LAME tag uses. */
 static uint16_t crc_a001(uint16_t crc, const unsigned char *p, size_t n)
@@ -112,7 +149,7 @@ static double spreading(double dz)
 }
 
 static void analyze_slot(ahmp3_encoder *e, int ch, const float *x32, float out[32]);
-static void mdct_long(ahmp3_encoder *e, const float block[36], int type, float out[18]);
+static void mdct_long(const ahmp3_encoder *e, const float block[36], int type, float out[18]);
 
 /* Energy of the MDCT lines of a full-scale tone, so levels can be read as
    dB SPL with a full-scale tone at 96 dB. */
@@ -121,8 +158,10 @@ static double calibrate(ahmp3_encoder *e)
     float slots[36][32];
     double tone_energy = 0;
     float saved[512];
+    int saved_pos = e->X_pos[0];
     memcpy(saved, e->X[0], sizeof(saved));
     memset(e->X[0], 0, sizeof(e->X[0]));
+    e->X_pos[0] = 0;
     for (int n = 0; n < 4 * 576; n += 32) {
         float x[32];
         for (int i = 0; i < 32; i++) x[i] = (float)sin(2 * AHMP3_PI * 1000.0 * (n + i) / ahmp3_sample_rates[e->sr_index]);
@@ -138,6 +177,7 @@ static double calibrate(ahmp3_encoder *e)
         for (int k = 0; k < 18; k++) tone_energy += (double)out[k] * out[k];
     }
     memcpy(e->X[0], saved, sizeof(saved));
+    e->X_pos[0] = saved_pos;
     return tone_energy;
 }
 
@@ -171,12 +211,27 @@ ahmp3_encoder *ahmp3_encoder_new(const ahmp3_encoder_config *c)
     e->prev_block = 0;
     e->seek_stride = 1;
 
-    for (int k = 0; k < 32; k++)
-        for (int i = 0; i < 64; i++) e->analysis[k][i] = (float)cos((2 * k + 1) * (i - 16) * AHMP3_PI / 64);
-    for (int k = 0; k < 18; k++)
-        for (int n = 0; n < 36; n++) e->mdct_cos_long[k][n] = (float)cos(AHMP3_PI / 72 * (2 * n + 1 + 18) * (2 * k + 1));
+    for (int k = 0; k < 16; k++) e->inv2cos32[k] = (float)(0.5 / cos((2 * k + 1) * AHMP3_PI / 64.0));
+    for (int k = 0; k < 8; k++) e->inv2cos16[k] = (float)(0.5 / cos((2 * k + 1) * AHMP3_PI / 32.0));
+    for (int k = 0; k < 4; k++) e->inv2cos8[k] = (float)(0.5 / cos((2 * k + 1) * AHMP3_PI / 16.0));
+    for (int k = 0; k < 2; k++) e->inv2cos4[k] = (float)(0.5 / cos((2 * k + 1) * AHMP3_PI / 8.0));
+
+    for (int k = 0; k < 18; k++) {
+        for (int r = 0; r < 9; r++) {
+            double ang_a = AHMP3_PI / 72.0 * (2 * (8 - r) + 19) * (2 * k + 1);
+            double ang_b = AHMP3_PI / 72.0 * (2 * (26 - r) + 19) * (2 * k + 1);
+            e->mdct18_a[k][r] = (float)(cos(ang_a) / 9.0);
+            e->mdct18_b[k][r] = (float)(cos(ang_b) / 9.0);
+        }
+    }
     for (int k = 0; k < 6; k++)
-        for (int n = 0; n < 12; n++) e->mdct_cos_short[k][n] = (float)cos(AHMP3_PI / 24 * (2 * n + 1 + 6) * (2 * k + 1));
+        for (int n = 0; n < 12; n++) e->mdct_cos_short[k][n] = (float)(cos(AHMP3_PI / 24.0 * (2 * n + 1 + 6) * (2 * k + 1)) / 3.0);
+
+    for (int i = 0; i < STEP_TAB; i++) {
+        int step = i - STEP_OFF;
+        e->pow2_q[i] = (float)pow(2.0, -3.0 * step / 16.0);
+        e->pow2_r[i] = (float)pow(2.0, step / 4.0);
+    }
 
     /* Lowpass: fewer bits per channel buy less treble, as other encoders do. */
     double rate = c->sample_rate, per_channel = (double)c->bitrate_kbps / channels * (channels == 2 && e->mode == 1 ? 1.25 : 1);
@@ -254,55 +309,140 @@ int ahmp3_encoder_delay(const ahmp3_encoder *e)
 
 /* ---- analysis filter bank and MDCT --------------------------------------- */
 
+/* Radix-2 fast DCT-III (Lee's algorithm) for the 32-band analysis matrix. */
+static inline void dct3_2(const float x[2], float y[2])
+{
+    float t = x[1] * 0.7071067811865475f;
+    y[0] = x[0] + t;
+    y[1] = x[0] - t;
+}
+
+static inline void dct3_4(const ahmp3_encoder *e, const float x[4], float y[4])
+{
+    float ev[2] = {x[0], x[2]};
+    float od[2] = {x[1], x[1] + x[3]};
+    float E[2], O[2];
+    dct3_2(ev, E);
+    dct3_2(od, O);
+    float t0 = O[0] * e->inv2cos4[0];
+    float t1 = O[1] * e->inv2cos4[1];
+    y[0] = E[0] + t0;
+    y[3] = E[0] - t0;
+    y[1] = E[1] + t1;
+    y[2] = E[1] - t1;
+}
+
+static inline void dct3_8(const ahmp3_encoder *e, const float x[8], float y[8])
+{
+    float ev[4] = {x[0], x[2], x[4], x[6]};
+    float od[4] = {x[1], x[1] + x[3], x[3] + x[5], x[5] + x[7]};
+    float E[4], O[4];
+    dct3_4(e, ev, E);
+    dct3_4(e, od, O);
+    for (int k = 0; k < 4; k++) {
+        float t = O[k] * e->inv2cos8[k];
+        y[k] = E[k] + t;
+        y[7 - k] = E[k] - t;
+    }
+}
+
+static inline void dct3_16(const ahmp3_encoder *e, const float x[16], float y[16])
+{
+    float ev[8], od[8], E[8], O[8];
+    for (int m = 0; m < 8; m++) ev[m] = x[2 * m];
+    od[0] = x[1];
+    for (int m = 1; m < 8; m++) od[m] = x[2 * m - 1] + x[2 * m + 1];
+    dct3_8(e, ev, E);
+    dct3_8(e, od, O);
+    for (int k = 0; k < 8; k++) {
+        float t = O[k] * e->inv2cos16[k];
+        y[k] = E[k] + t;
+        y[15 - k] = E[k] - t;
+    }
+}
+
+static inline void dct3_32(const ahmp3_encoder *e, const float x[32], float y[32])
+{
+    float ev[16], od[16], E[16], O[16];
+    for (int m = 0; m < 16; m++) ev[m] = x[2 * m];
+    od[0] = x[1];
+    for (int m = 1; m < 16; m++) od[m] = x[2 * m - 1] + x[2 * m + 1];
+    dct3_16(e, ev, E);
+    dct3_16(e, od, O);
+    for (int k = 0; k < 16; k++) {
+        float t = O[k] * e->inv2cos32[k];
+        y[k] = E[k] + t;
+        y[31 - k] = E[k] - t;
+    }
+}
+
 /* 32 new input samples -> one sample per subband (ISO 11172-3 C.1.3). */
 static void analyze_slot(ahmp3_encoder *e, int ch, const float *x32, float out[32])
 {
     float *X = e->X[ch];
-    memmove(X + 32, X, (512 - 32) * sizeof(float));
-    for (int i = 0; i < 32; i++) X[31 - i] = x32[i];
+    int pos = (e->X_pos[ch] - 32) & 511;
+    e->X_pos[ch] = pos;
+    for (int i = 0; i < 32; i++) X[pos + 31 - i] = x32[i];
+
+    const float *D = e->t.D;
     float Y[64];
     for (int i = 0; i < 64; i++) {
-        float s = 0;
-        for (int j = 0; j < 8; j++) s += e->t.D[i + 64 * j] * X[i + 64 * j];
-        Y[i] = s / 32;
+        float s = D[i] * X[(pos + i) & 511]
+                + D[i + 64] * X[(pos + i + 64) & 511]
+                + D[i + 128] * X[(pos + i + 128) & 511]
+                + D[i + 192] * X[(pos + i + 192) & 511]
+                + D[i + 256] * X[(pos + i + 256) & 511]
+                + D[i + 320] * X[(pos + i + 320) & 511]
+                + D[i + 384] * X[(pos + i + 384) & 511]
+                + D[i + 448] * X[(pos + i + 448) & 511];
+        Y[i] = s * (1.0f / 32.0f);
     }
-    for (int k = 0; k < 32; k++) {
-        const float *m = e->analysis[k];
+
+    float Z[32];
+    Z[0] = Y[16];
+    for (int d = 1; d <= 16; d++) Z[d] = Y[16 + d] + Y[16 - d];
+    for (int d = 17; d <= 31; d++) Z[d] = Y[16 + d] - Y[80 - d];
+    dct3_32(e, Z, out);
+}
+
+static void mdct_long(const ahmp3_encoder *e, const float block[36], int type, float out[18])
+{
+    const float *w = e->t.win[type];
+    float z[36];
+    for (int n = 0; n < 36; n++) z[n] = block[n] * w[n];
+    float a[9], b[9];
+    for (int r = 0; r < 9; r++) {
+        a[r] = z[8 - r] - z[9 + r];
+        b[r] = z[26 - r] + z[27 + r];
+    }
+    for (int k = 0; k < 18; k++) {
+        const float *ca = e->mdct18_a[k];
+        const float *cb = e->mdct18_b[k];
         float s = 0;
-        for (int i = 0; i < 64; i++) s += m[i] * Y[i];
+        for (int r = 0; r < 9; r++) s += a[r] * ca[r] + b[r] * cb[r];
         out[k] = s;
     }
 }
 
-static void mdct_long(ahmp3_encoder *e, const float block[36], int type, float out[18])
-{
-    float z[36];
-    for (int n = 0; n < 36; n++) z[n] = block[n] * e->t.win[type][n];
-    for (int k = 0; k < 18; k++) {
-        const float *c = e->mdct_cos_long[k];
-        float s = 0;
-        for (int n = 0; n < 36; n++) s += z[n] * c[n];
-        out[k] = s / 9;
-    }
-}
-
 /* Three short transforms; out holds window w's coefficient k at 3k + w. */
-static void mdct_short(ahmp3_encoder *e, const float block[36], float out[18])
+static void mdct_short(const ahmp3_encoder *e, const float block[36], float out[18])
 {
+    const float *win = e->t.win[2];
     for (int w = 0; w < 3; w++) {
         float z[12];
-        for (int n = 0; n < 12; n++) z[n] = block[6 + 6 * w + n] * e->t.win[2][n];
+        const float *src = block + 6 + 6 * w;
+        for (int n = 0; n < 12; n++) z[n] = src[n] * win[n];
         for (int k = 0; k < 6; k++) {
             const float *c = e->mdct_cos_short[k];
             float s = 0;
             for (int n = 0; n < 12; n++) s += z[n] * c[n];
-            out[3 * k + w] = s / 3;
+            out[3 * k + w] = s;
         }
     }
 }
 
 /* Spectrum of one granule, in the order the decoder reads it. */
-static void transform(ahmp3_encoder *e, const float prev[18][32], const float cur[18][32], int block_type,
+static void transform(const ahmp3_encoder *e, const float prev[18][32], const float cur[18][32], int block_type,
                       float xr[576])
 {
     if (block_type != 2) {
@@ -366,12 +506,11 @@ static bool attack(const granule_in *before, const granule_in *g)
 {
     float history = 0;
     for (int t = 0; t < 18; t++) history += before->energy[t];
-    history /= 18;
+    history *= (1.0f / 18.0f);
     float running = history;
     for (int t = 0; t < 18; t += 3) {
-        float now = g->energy[t] + g->energy[t + 1] + g->energy[t + 2];
-        now /= 3;
-        if (now > 1e-7f && now > 12 * running) return true;
+        float now = (g->energy[t] + g->energy[t + 1] + g->energy[t + 2]) * (1.0f / 3.0f);
+        if (now > 1e-7f && now > 12.0f * running) return true;
         running = 0.6f * running + 0.4f * now;
     }
     return false;
@@ -392,59 +531,63 @@ static void mask_long(ahmp3_encoder *e, int ch, const float xr[576], mask *m)
     const short *sl = ahmp3_sfb_long[e->sr_index];
     float tonal[22];
     for (int b = 0; b < 22; b++) {
-        double sum = 0, logsum = 0, peak = 0;
+        float sum = 0.0f, log2sum = 0.0f;
         int n = sl[b + 1] - sl[b];
         for (int j = sl[b]; j < sl[b + 1]; j++) {
-            double v = (double)xr[j] * xr[j];
+            float v = xr[j] * xr[j];
             sum += v;
-            logsum += log(v + 1e-20);
-            if (v > peak) peak = v;
+            log2sum += fast_log2f(v + 1e-20f);
         }
-        m->energy[b] = (float)sum;
+        m->energy[b] = sum;
         /* Spectral flatness: a peaky band is tonal and masks less. */
-        double flat = n > 1 && sum > 0 ? exp(logsum / n) / (sum / n) : 1;
-        double sfm_db = 10 * log10(flat + 1e-20);
-        double t = sfm_db / -25;
-        tonal[b] = (float)(t < 0 ? 0 : t > 1 ? 1 : t);
+        float t = 0.0f;
+        if (n > 1 && sum > 0.0f) {
+            float sfm_db = (log2sum / (float)n - fast_log2f(sum / (float)n + 1e-20f)) * 3.01029996f;
+            t = sfm_db * (-1.0f / 25.0f);
+            if (t < 0.0f) t = 0.0f;
+            else if (t > 1.0f) t = 1.0f;
+        }
+        tonal[b] = t;
     }
-    m->pe = 0;
+    m->pe = 0.0f;
     for (int b = 0; b < 22; b++) {
-        double spread = 0;
-        for (int k = 0; k < 22; k++) spread += m->energy[k] * e->spread_long[b][k];
-        double offset_db = tonal[b] * (14.5 + e->bark_long[b]) + (1 - tonal[b]) * 5.5;
-        if (offset_db < 6) offset_db = 6;
-        double thr = spread * pow(10, -offset_db / 10);
+        float spread = 0.0f;
+        const float *sp = e->spread_long[b];
+        for (int k = 0; k < 22; k++) spread += m->energy[k] * sp[k];
+        float offset_db = tonal[b] * (14.5f + e->bark_long[b]) + (1.0f - tonal[b]) * 5.5f;
+        if (offset_db < 6.0f) offset_db = 6.0f;
+        /* 10^(-offset_db/10) = 2^(-offset_db * log2(10) / 10) */
+        float thr = spread * fast_pow2f(offset_db * -0.332192809f);
         /* Pre-echo: the threshold may not jump far above the last one. */
-        if (thr > 2 * e->prev_xmin[ch][b]) thr = 2 * e->prev_xmin[ch][b];
-        e->prev_xmin[ch][b] = (float)thr;
+        if (thr > 2.0f * e->prev_xmin[ch][b]) thr = 2.0f * e->prev_xmin[ch][b];
+        e->prev_xmin[ch][b] = thr;
         if (thr < e->ath_long[b]) thr = e->ath_long[b];
-        m->xmin[b] = (float)thr;
-        if (m->energy[b] > thr) m->pe += (sl[b + 1] - sl[b]) * (float)log2(m->energy[b] / thr) * 0.5f;
+        m->xmin[b] = thr;
+        if (m->energy[b] > thr) m->pe += (float)(sl[b + 1] - sl[b]) * fast_log2f(m->energy[b] / thr) * 0.5f;
     }
 }
 
 static void mask_short(ahmp3_encoder *e, int ch, const float xr[576], mask *m)
 {
     const short *ss = ahmp3_sfb_short[e->sr_index];
-    m->pe = 0;
+    m->pe = 0.0f;
     for (int w = 0; w < 3; w++) {
         for (int b = 0; b < 13; b++) {
             int len = ss[b + 1] - ss[b];
-            double sum = 0;
-            for (int j = 0; j < len; j++) {
-                float v = xr[3 * ss[b] + w * len + j];
-                sum += (double)v * v;
-            }
-            m->energy_s[b][w] = (float)sum;
+            float sum = 0.0f;
+            const float *p = xr + 3 * ss[b] + w * len;
+            for (int j = 0; j < len; j++) sum += p[j] * p[j];
+            m->energy_s[b][w] = sum;
         }
         for (int b = 0; b < 13; b++) {
-            double spread = 0;
-            for (int k = 0; k < 13; k++) spread += m->energy_s[k][w] * e->spread_short[b][k];
-            double thr = spread * pow(10, -7.0 / 10);
+            float spread = 0.0f;
+            const float *sp = e->spread_short[b];
+            for (int k = 0; k < 13; k++) spread += m->energy_s[k][w] * sp[k];
+            float thr = spread * 0.19952623f; /* 10^(-0.7) */
             if (thr < e->ath_short[b]) thr = e->ath_short[b];
-            m->xmin_s[b][w] = (float)thr;
+            m->xmin_s[b][w] = thr;
             if (m->energy_s[b][w] > thr)
-                m->pe += (ss[b + 1] - ss[b]) * (float)log2(m->energy_s[b][w] / thr) * 0.5f;
+                m->pe += (float)(ss[b + 1] - ss[b]) * fast_log2f(m->energy_s[b][w] / thr) * 0.5f;
         }
     }
     /* After a short granule the next long one starts its pre-echo memory fresh. */
@@ -455,13 +598,36 @@ static void mask_short(ahmp3_encoder *e, int ch, const float xr[576], mask *m)
 
 typedef struct {
     const float *xr;
-    float xr34[576];  /* |xr|^(3/4) */
+    float abs_xr[576];
+    float xr34[576];     /* |xr|^(3/4) */
     float xmax34;
-    int cut;          /* lines from here up are zeroed (lowpass) */
+    float band_max34[39];
+    int cut;             /* lines from here up are zeroed (lowpass) */
+    int b_start[39];
+    int b_end[39];
+    int bands;
 } qin;
 
+static void init_band_lines(const ahmp3_encoder *e, const ahmp3_gr *G, qin *q)
+{
+    const short *sl = ahmp3_sfb_long[e->sr_index], *ss = ahmp3_sfb_short[e->sr_index];
+    int n = 0;
+    for (int i = 0; i < G->long_end; i++, n++) {
+        q->b_start[n] = sl[i];
+        q->b_end[n] = sl[i + 1];
+    }
+    for (int b = G->short_start; b < 13; b++) {
+        int len = ss[b + 1] - ss[b];
+        for (int w = 0; w < 3; w++, n++) {
+            q->b_start[n] = 3 * ss[b] + w * len;
+            q->b_end[n] = q->b_start[n] + len;
+        }
+    }
+    q->bands = n;
+}
+
 /* Quarter-step exponent of each scale factor band's step size. */
-static void band_steps(const ahmp3_encoder *e, const ahmp3_gr *G, int steps[39], int *bands)
+static inline void band_steps(const ahmp3_gr *G, int steps[39], int *bands)
 {
     int shift = G->scalefac_scale + 1, gain = G->global_gain - 210;
     int n = 0;
@@ -471,64 +637,81 @@ static void band_steps(const ahmp3_encoder *e, const ahmp3_gr *G, int steps[39],
     for (int i = G->short_start; i < 13; i++)
         for (int w = 0; w < 3; w++) steps[n++] = gain - 8 * G->subblock_gain[w] - (G->sf[k++] << shift);
     *bands = n;
-    (void)e;
 }
 
-/* The lines of band number n (as band_steps counts them). */
-static void band_lines(const ahmp3_encoder *e, const ahmp3_gr *G, int n, int *start, int *end)
+static inline float lookup_q(const ahmp3_encoder *e, int step)
 {
-    const short *sl = ahmp3_sfb_long[e->sr_index], *ss = ahmp3_sfb_short[e->sr_index];
-    if (n < G->long_end) {
-        *start = sl[n];
-        *end = sl[n + 1];
-        return;
-    }
-    n -= G->long_end;
-    int b = G->short_start + n / 3, w = n % 3, len = ss[b + 1] - ss[b];
-    *start = 3 * ss[b] + w * len;
-    *end = *start + len;
+    int idx = step + STEP_OFF;
+    if ((unsigned)idx < STEP_TAB) return e->pow2_q[idx];
+    return (float)pow(2.0, -3.0 * step / 16.0);
 }
 
-/* Quantizes with the granule's current gains. False when a value is too big
-   for the bitstream. */
-static bool quantize(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G)
+static inline float lookup_r(const ahmp3_encoder *e, int step)
+{
+    int idx = step + STEP_OFF;
+    if ((unsigned)idx < STEP_TAB) return e->pow2_r[idx];
+    return (float)pow(2.0, step / 4.0);
+}
+
+/* Quantizes unsigned magnitudes during the rate/distortion search. Overflow is
+   rejected upfront per band via band_max34 so the inner loop has no branches.
+   Signs are applied once the final gain is chosen. */
+static bool quantize_mag(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G)
 {
     int steps[39], bands;
-    band_steps(e, G, steps, &bands);
+    band_steps(G, steps, &bands);
+    float fband[39];
     for (int n = 0; n < bands; n++) {
-        int s, t;
-        band_lines(e, G, n, &s, &t);
-        float f = (float)pow(2.0, -3.0 * steps[n] / 16);
-        for (int j = s; j < t; j++) {
-            if (j >= q->cut) {
-                G->ix[j] = 0;
-                continue;
-            }
-            float v = q->xr34[j] * f + 0.4054f;
-            if (v > 8206) return false;
-            int ix = (int)v;
-            G->ix[j] = q->xr[j] < 0 ? -ix : ix;
+        float f = lookup_q(e, steps[n]);
+        fband[n] = f;
+        if (q->band_max34[n] * f + 0.4054f > 8206.0f) return false;
+    }
+    int * restrict ix = G->ix;
+    const float * restrict xr34 = q->xr34;
+    int cut = q->cut;
+    for (int n = 0; n < bands; n++) {
+        int s = q->b_start[n], t = q->b_end[n];
+        if (s >= cut) {
+            memset(ix + s, 0, (size_t)(t - s) * sizeof(int));
+            continue;
         }
+        int hi = t < cut ? t : cut;
+        float f = fband[n];
+        if (q->band_max34[n] * f < 0.5946f) {
+            memset(ix + s, 0, (size_t)(t - s) * sizeof(int));
+            continue;
+        }
+        for (int j = s; j < hi; j++) ix[j] = (int)(xr34[j] * f + 0.4054f);
+        if (hi < t) memset(ix + hi, 0, (size_t)(t - hi) * sizeof(int));
     }
     return true;
+}
+
+static void apply_signs(const qin *q, ahmp3_gr *G)
+{
+    const float *xr = q->xr;
+    int *ix = G->ix;
+    for (int j = 0; j < 576; j++)
+        if (ix[j] && xr[j] < 0.0f) ix[j] = -ix[j];
 }
 
 /* Quantization noise energy per band. */
 static void noise(const ahmp3_encoder *e, const qin *q, const ahmp3_gr *G, float out[39])
 {
     int steps[39], bands;
-    band_steps(e, G, steps, &bands);
+    band_steps(G, steps, &bands);
+    const float *pow43 = e->t.pow43;
     for (int n = 0; n < bands; n++) {
-        int s, t;
-        band_lines(e, G, n, &s, &t);
-        float f = (float)pow(2.0, steps[n] / 4.0);
-        double sum = 0;
+        int s = q->b_start[n], t = q->b_end[n];
+        float f = lookup_r(e, steps[n]);
+        float sum = 0.0f;
         for (int j = s; j < t; j++) {
-            int ix = G->ix[j] < 0 ? -G->ix[j] : G->ix[j];
-            double d = fabs(q->xr[j]) - e->t.pow43[ix] * f;
+            int ix = G->ix[j];
+            if (ix < 0) ix = -ix;
+            float d = q->abs_xr[j] - pow43[ix] * f;
             sum += d * d;
         }
-        out[n] = (float)sum;
+        out[n] = sum;
     }
 }
 
@@ -540,48 +723,117 @@ static int granule_bits(const ahmp3_encoder *e, ahmp3_gr *G, bool best_split)
     return ahmp3_part2_bits(G, e->lsf, false, NULL) + ahmp3_huffman_choose(G, e->sr_index, best_split);
 }
 
-/* Inner loop: the finest global gain whose bits fit. */
-static int fit_gain(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G, int target)
+/* Inner loop: the finest global gain whose bits fit. When a hint from the
+   previous outer iteration is given, an exponential bracket converges around
+   it before bisecting. Leaves unsigned magnitudes in G->ix. */
+static int fit_gain(const ahmp3_encoder *e, const qin *q, ahmp3_gr *G, int target, int min_lo, int hint)
 {
-    int lo = 0, hi = 255, best = 255;
+    int lo = min_lo, hi = 255, best = 255, best_bits = 0;
+    int last_g = -1;
+    if (hint >= min_lo && hint <= 255) {
+        G->global_gain = hint;
+        last_g = hint;
+        int b = quantize_mag(e, q, G) ? granule_bits(e, G, false) : (1 << 20);
+        if (b <= target) {
+            best = hint;
+            best_bits = b;
+            hi = hint - 1;
+            int step = 1;
+            while (best - step >= lo) {
+                int p = best - step;
+                G->global_gain = p;
+                last_g = p;
+                b = quantize_mag(e, q, G) ? granule_bits(e, G, false) : (1 << 20);
+                if (b <= target) {
+                    best = p;
+                    best_bits = b;
+                    hi = p - 1;
+                    step <<= 1;
+                } else {
+                    lo = p + 1;
+                    break;
+                }
+            }
+        } else {
+            lo = hint + 1;
+            int step = 2;
+            while (lo < hi) {
+                int p = hint + step;
+                if (p >= hi) p = hi;
+                G->global_gain = p;
+                last_g = p;
+                b = quantize_mag(e, q, G) ? granule_bits(e, G, false) : (1 << 20);
+                if (b <= target) {
+                    best = p;
+                    best_bits = b;
+                    hi = p - 1;
+                    break;
+                }
+                lo = p + 1;
+                if (p == 255) break;
+                step <<= 1;
+            }
+        }
+    }
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
+        int mid = (lo + hi) >> 1;
         G->global_gain = mid;
-        if (quantize(e, q, G) && granule_bits(e, G, false) <= target) {
+        last_g = mid;
+        int b = quantize_mag(e, q, G) ? granule_bits(e, G, false) : (1 << 20);
+        if (b <= target) {
             best = mid;
+            best_bits = b;
             hi = mid - 1;
         } else {
             lo = mid + 1;
         }
     }
     G->global_gain = best;
-    quantize(e, q, G);
-    return granule_bits(e, G, false);
+    if (last_g != best) {
+        quantize_mag(e, q, G);
+        best_bits = granule_bits(e, G, false);
+    }
+    return best_bits;
 }
 
-/* Outer loop: shapes the noise under the masking threshold by raising the
-   scale factors of bands that are too noisy, keeping the best attempt. */
 /* Gets a granule ready for the loops: |xr|^(3/4) with the lowpass applied,
    and its side information cleared. */
 static void prepare(const ahmp3_encoder *e, const float xr[576], ahmp3_gr *G, qin *q)
 {
     q->xr = xr;
-    q->xmax34 = 0;
-    q->cut = G->block_type == 2 ? 576 : (int)(e->cutoff * 576);
+    q->xmax34 = 0.0f;
+    q->cut = G->block_type == 2 ? 576 : (int)(e->cutoff * 576.0f);
+    init_band_lines(e, G, q);
     for (int j = 0; j < 576; j++) {
-        q->xr34[j] = (float)pow(fabs(xr[j]), 0.75);
-        if (q->xr34[j] > q->xmax34) q->xmax34 = q->xr34[j];
+        float a = fabsf(xr[j]);
+        q->abs_xr[j] = a;
+        float s = sqrtf(a);
+        float v = s * sqrtf(s);
+        q->xr34[j] = v;
+        if (j < q->cut && v > q->xmax34) q->xmax34 = v;
     }
     if (G->block_type == 2) {
         /* Short blocks: the lowpass applies within each window. */
         const short *ss = ahmp3_sfb_short[e->sr_index];
-        int cut = (int)(e->cutoff * 192);
+        int cut = (int)(e->cutoff * 192.0f);
+        q->xmax34 = 0.0f;
         for (int b = 0; b < 13; b++) {
             int len = ss[b + 1] - ss[b];
             for (int w = 0; w < 3; w++)
-                for (int j = 0; j < len; j++)
-                    if (ss[b] + j >= cut) q->xr34[3 * ss[b] + w * len + j] = 0;
+                for (int j = 0; j < len; j++) {
+                    int idx = 3 * ss[b] + w * len + j;
+                    if (ss[b] + j >= cut) q->xr34[idx] = 0.0f;
+                    else if (q->xr34[idx] > q->xmax34) q->xmax34 = q->xr34[idx];
+                }
         }
+    }
+    for (int n = 0; n < q->bands; n++) {
+        int s = q->b_start[n], t = q->b_end[n];
+        int hi = t < q->cut ? t : q->cut;
+        float mx = 0.0f;
+        for (int j = s; j < hi; j++)
+            if (q->xr34[j] > mx) mx = q->xr34[j];
+        q->band_max34[n] = mx;
     }
     memset(G->sf, 0, sizeof(G->sf));
     G->scalefac_scale = 0;
@@ -605,44 +857,40 @@ static void code_granule_vbr(ahmp3_encoder *e, const float xr[576], const mask *
     qin q;
     prepare(e, xr, G, &q);
     if (max_bits > 4095) max_bits = 4095;
-    if (q.xmax34 == 0 || max_bits < 16) {
+    if (q.xmax34 == 0.0f || max_bits < 16) {
         silence(e, G);
         return;
     }
-    int bands = 0, steps[39], need[39];
+    int bands = q.bands, need[39];
     bool live[39];
-    band_steps(e, G, steps, &bands);
     int counted = G->long_end == 22 ? 21 : bands - 3; /* the last band has no scale factor */
     int global = -1;
     for (int n = 0; n < bands; n++) {
-        int s, t;
-        band_lines(e, G, n, &s, &t);
-        double allowed = e->vbr_noise * (n < G->long_end ? m->xmin[n] : m->xmin_s[G->short_start + (n - G->long_end) / 3][(n - G->long_end) % 3]);
+        int s = q.b_start[n], t = q.b_end[n];
+        float allowed = (float)(e->vbr_noise * (n < G->long_end ? m->xmin[n] : m->xmin_s[G->short_start + (n - G->long_end) / 3][(n - G->long_end) % 3]));
         /* The largest gain (coarsest step) whose noise stays under the
            threshold. A band quieter than its threshold needs nothing; one
            that cannot get under it takes the finest step its largest value
            allows. */
-        float top = 0;
-        for (int j = s; j < t; j++)
-            if (j < q.cut && q.xr34[j] > top) top = q.xr34[j];
+        float top = q.band_max34[n];
         int finest = 0;
-        if (top > 0) {
-            finest = 210 + (int)ceil(16.0 / 3 * log2(top / 8205.0));
+        if (top > 0.0f) {
+            finest = 210 + (int)ceilf((16.0f / 3.0f) * fast_log2f(top / 8205.0f));
             if (finest < 0) finest = 0;
         }
         int lo = finest, hi = 255, best = finest;
         while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            float fq = (float)pow(2.0, -3.0 * (mid - 210) / 16), fr = (float)pow(2.0, (mid - 210) / 4.0);
-            double sum = 0;
+            int mid = (lo + hi) >> 1;
+            float fq = lookup_q(e, mid - 210), fr = lookup_r(e, mid - 210);
+            float sum = 0.0f;
             for (int j = s; j < t && sum <= allowed; j++) {
-                if (q.xr34[j] == 0 || j >= q.cut) continue; /* removed by the lowpass */
+                if (q.xr34[j] == 0.0f || j >= q.cut) continue; /* removed by the lowpass */
                 float v = q.xr34[j] * fq + 0.4054f;
-                if (v > 8206) {
-                    sum = 1e300;
+                if (v > 8206.0f) {
+                    sum = 1e30f;
                     break;
                 }
-                double d = fabs(xr[j]) - e->t.pow43[(int)v] * fr;
+                float d = q.abs_xr[j] - e->t.pow43[(int)v] * fr;
                 sum += d * d;
             }
             if (sum <= allowed) {
@@ -680,22 +928,25 @@ static void code_granule_vbr(ahmp3_encoder *e, const float xr[576], const mask *
     for (int n = 0; n < counted; n++)
         G->sf[n] = (unsigned char)(live[n] && need[n] < global ? (global - need[n] + (1 << shift) - 1) >> shift : 0);
     G->global_gain = global;
-    while (!quantize(e, &q, G) && G->global_gain < 255) G->global_gain++;
+    while (!quantize_mag(e, &q, G) && G->global_gain < 255) G->global_gain++;
     int bits = granule_bits(e, G, true);
     if (bits > max_bits) {
         /* More than the frame can carry: coarsen until it fits. */
-        fit_gain(e, &q, G, max_bits);
+        fit_gain(e, &q, G, max_bits, 0, G->global_gain);
         bits = granule_bits(e, G, true);
     }
+    apply_signs(&q, G);
     G->part23 = bits;
 }
 
+/* Outer loop: shapes the noise under the masking threshold by raising the
+   scale factors of bands that are too noisy, keeping the best attempt. */
 static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, ahmp3_gr *G, int target)
 {
     qin q;
     prepare(e, xr, G, &q);
     if (target > 4095) target = 4095;
-    if (q.xmax34 == 0 || target < 16) {
+    if (q.xmax34 == 0.0f || target < 16) {
         memset(G->ix, 0, sizeof(G->ix));
         G->global_gain = 0;
         G->part23 = granule_bits(e, G, true);
@@ -703,8 +954,7 @@ static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, a
     }
 
     float xmin[39];
-    int bands = 0, steps[39];
-    band_steps(e, G, steps, &bands);
+    int bands = q.bands;
     for (int n = 0; n < bands; n++) {
         if (n < G->long_end) {
             xmin[n] = m->xmin[n];
@@ -717,25 +967,35 @@ static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, a
     /* Band 21 (12 for short) has no scale factor; its noise is not counted. */
     int counted = G->long_end == 22 ? 21 : bands - 3;
 
+    /* Minimum global_gain below which xmax34 would exceed 8206 with sf=0. */
+    int min_lo = 210 + (int)floorf((16.0f / 3.0f) * fast_log2f(q.xmax34 / 8205.0f)) - 1;
+    if (min_lo < 0) min_lo = 0;
+    if (min_lo > 255) min_lo = 255;
+
     ahmp3_gr best = *G;
     int best_over = 1 << 30;
-    double best_over_db = 1e30;
-    for (int iter = 0; iter < 40; iter++) {
-        fit_gain(e, &q, G, target);
+    float best_over_db = 1e30f;
+    int hint = -1, stale = 0;
+    for (int iter = 0; iter < 16; iter++) {
+        fit_gain(e, &q, G, target, min_lo, hint);
+        hint = G->global_gain;
         float nz[39];
         noise(e, &q, G, nz);
         int over = 0;
-        double over_db = 0;
+        float over_db = 0.0f;
         for (int n = 0; n < counted; n++) {
             if (nz[n] > xmin[n]) {
                 over++;
-                over_db += 10 * log10(nz[n] / xmin[n]);
+                over_db += fast_log2f(nz[n] / xmin[n]);
             }
         }
         if (over < best_over || (over == best_over && over_db < best_over_db)) {
             best = *G;
             best_over = over;
             best_over_db = over_db;
+            stale = 0;
+        } else if (++stale >= 3) {
+            break;
         }
         if (!over) break;
 
@@ -757,11 +1017,13 @@ static void code_granule(ahmp3_encoder *e, const float xr[576], const mask *m, a
             /* Coarser scale factor steps reach twice as far. */
             G->scalefac_scale = 1;
             for (int n = 0; n < bands; n++) G->sf[n] = (unsigned char)((G->sf[n] + 1) / 2);
+            hint = -1;
+            stale = 0;
         }
         if (!changed || all) break;
     }
     *G = best;
-    quantize(e, &q, G);
+    apply_signs(&q, G);
     G->part23 = granule_bits(e, G, true);
 }
 
@@ -827,27 +1089,24 @@ static size_t emit(ahmp3_encoder *e, uint8_t *out, size_t cap, bool all)
     return written;
 }
 
-static void ms_decision(ahmp3_encoder *e, float xr[2][576], const mask m[2], bool shortb, bool *use_ms)
+static void ms_decision(ahmp3_encoder *e, const float xr0[576], const float xr1[576], bool *use_ms)
 {
     *use_ms = false;
     if (e->mode != 1) return;
     /* Mid/side pays off when the channels are alike: compare how much
        signal stands above the threshold each way. */
-    double lr = 0, ms = 0;
+    float lr = 0.0f, ms = 0.0f;
     for (int j = 0; j < 576; j++) {
-        double l = xr[0][j], r = xr[1][j];
-        double mid = (l + r) * 0.70710678, side = (l - r) * 0.70710678;
-        lr += log1p(fabs(l) * 1000) + log1p(fabs(r) * 1000);
-        ms += log1p(fabs(mid) * 1000) + log1p(fabs(side) * 1000);
+        float l = xr0[j], r = xr1[j];
+        float mid = (l + r) * 0.70710678f, side = (l - r) * 0.70710678f;
+        lr += fast_log2f(fabsf(l) * 1000.0f + 1.0f) + fast_log2f(fabsf(r) * 1000.0f + 1.0f);
+        ms += fast_log2f(fabsf(mid) * 1000.0f + 1.0f) + fast_log2f(fabsf(side) * 1000.0f + 1.0f);
     }
-    (void)m;
-    (void)shortb;
-    *use_ms = ms < lr * 0.95;
+    *use_ms = ms < lr * 0.95f;
 }
 
-static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
+static void code_frame(ahmp3_encoder *e, int block_types[2])
 {
-    (void)dummy;
     ahmp3_fr fr;
     memset(&fr, 0, sizeof(fr));
     int padding = 0;
@@ -880,21 +1139,14 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
     mask m[2][2];
     for (int g = 0; g < e->granules; g++) {
         granule_in *cur = e->queue[1 + g];
-        float (*prev)[32];
         for (int ch = 0; ch < e->channels; ch++) {
-            prev = e->queue[g][ch].sub;
-            transform(e, (const float (*)[32])prev, (const float (*)[32])cur[ch].sub, block_types[g], xr[g][ch]);
+            transform(e, (const float (*)[32])e->queue[g][ch].sub, (const float (*)[32])cur[ch].sub, block_types[g], xr[g][ch]);
             if (block_types[g] == 2) mask_short(e, ch, xr[g][ch], &m[g][ch]);
             else mask_long(e, ch, xr[g][ch], &m[g][ch]);
         }
     }
     bool ms = false;
-    if (e->channels == 2) {
-        float both[2][576];
-        memcpy(both[0], xr[0][0], sizeof(both[0]));
-        memcpy(both[1], xr[0][1], sizeof(both[1]));
-        ms_decision(e, both, m[0], block_types[0] == 2, &ms);
-    }
+    if (e->channels == 2) ms_decision(e, xr[0][0], xr[0][1], &ms);
     fr.mode_ext = ms ? 2 : 0;
     if (ms) {
         for (int g = 0; g < e->granules; g++) {
@@ -937,7 +1189,7 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
     /* Share the bits: an even split, moved toward the granules and channels
        that need more, while keeping some reservoir for hard passages. */
     int parts = e->granules * e->channels;
-    float pe_total = 0;
+    float pe_total = 0.0f;
     for (int g = 0; g < e->granules; g++)
         for (int ch = 0; ch < e->channels; ch++) pe_total += m[g][ch].pe;
     float mean_bits = slot * 8.0f / parts;
@@ -948,7 +1200,7 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
     int remaining = budget;
     for (int g = 0; g < e->granules; g++) {
         for (int ch = 0; ch < e->channels; ch++) {
-            float share = pe_total > 0 ? m[g][ch].pe / pe_total : 1.0f / parts;
+            float share = pe_total > 0.0f ? m[g][ch].pe / pe_total : 1.0f / parts;
             float evenly = 1.0f / parts;
             int target = (int)(mean_bits + want_extra * (0.5f * share + 0.5f * evenly));
             int left_parts = (e->granules - g) * e->channels - ch;
@@ -1000,14 +1252,14 @@ static void code_frame(ahmp3_encoder *e, int block_types[2], uint8_t *dummy)
         remaining -= G->part23;
     }
 
-    unsigned char main[4096];
-    int main_bits = ahmp3_write_main(&fr, main, sizeof(main));
+    unsigned char main_buf[4096];
+    int main_bits = ahmp3_write_main(&fr, main_buf, sizeof(main_buf));
     int main_bytes = (main_bits + 7) / 8;
     pending *p = &e->frames[e->frame_count++];
     p->head_bytes = ahmp3_write_header(&fr, p->head);
     p->slot = slot;
     e->slots_pending += slot;
-    memcpy(e->fifo + e->fifo_len, main, (size_t)main_bytes);
+    memcpy(e->fifo + e->fifo_len, main_buf, (size_t)main_bytes);
     e->fifo_len += main_bytes;
 }
 
@@ -1049,7 +1301,7 @@ static size_t step(ahmp3_encoder *e, uint8_t *out, size_t cap)
         memmove(e->frames, e->frames + 1, (size_t)(e->frame_count - 1) * sizeof(pending));
         e->frame_count--;
     }
-    code_frame(e, types, NULL);
+    code_frame(e, types);
 
     /* Slide the queue: the last granule coded becomes the one before the
        next frame, and the lookahead granule its first. */
@@ -1098,12 +1350,32 @@ size_t ahmp3_encode(ahmp3_encoder *e, const float *pcm, size_t samples, uint8_t 
 
 size_t ahmp3_encode_s16(ahmp3_encoder *e, const int16_t *pcm, size_t samples, uint8_t *out, size_t out_cap)
 {
-    float buf[1024];
+    const float inv = 1.0f / 32768.0f;
     size_t written = 0;
+    if (e->channels == 2 && e->channels_in == 2) {
+        size_t i = 0;
+        while (i < samples) {
+            size_t take = (size_t)(576 - e->in_len);
+            if (take > samples - i) take = samples - i;
+            float *l = e->in[0] + e->in_len;
+            float *r = e->in[1] + e->in_len;
+            const int16_t *s = pcm + i * 2;
+            for (size_t k = 0; k < take; k++) {
+                l[k] = (float)s[2 * k] * inv;
+                r[k] = (float)s[2 * k + 1] * inv;
+            }
+            e->in_len += (int)take;
+            i += take;
+            if (e->in_len == 576) written += push(e, out + written, out_cap - written);
+        }
+        e->samples_in += (long long)samples;
+        return written;
+    }
+    float buf[1024];
     size_t per = 1024 / (size_t)e->channels_in;
     for (size_t i = 0; i < samples; i += per) {
         size_t n = samples - i < per ? samples - i : per;
-        for (size_t j = 0; j < n * (size_t)e->channels_in; j++) buf[j] = pcm[i * e->channels_in + j] / 32768.0f;
+        for (size_t j = 0; j < n * (size_t)e->channels_in; j++) buf[j] = (float)pcm[i * e->channels_in + j] * inv;
         written += ahmp3_encode(e, buf, n, out + written, out_cap - written);
     }
     return written;

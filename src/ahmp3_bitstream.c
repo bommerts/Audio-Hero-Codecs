@@ -82,6 +82,7 @@ static int part2(writer *w, const ahmp3_gr *G, int lsf, bool intensity_right, co
         }
         return bits;
     }
+    if (!w && !first) return 11 * slen1 + 10 * slen2;
     for (int k = 0; k < 4; k++) {
         if (first && (G->scfsi & (8 >> k))) continue;
         int slen = k < 2 ? slen1 : slen2;
@@ -114,10 +115,13 @@ int ahmp3_sf_limit(const ahmp3_gr *G, int lsf, int n)
     return b < 6 ? 15 : 7;
 }
 
-static int bits_for(int v)
+static inline int bits_for(int v)
 {
-    int n = 0;
-    while (v >> n) n++;
+    static const unsigned char small[16] = {0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4};
+    if ((unsigned)v < 16u) return small[v];
+    int n = 4;
+    v >>= 4;
+    while (v) { n++; v >>= 1; }
     return n;
 }
 
@@ -160,20 +164,20 @@ bool ahmp3_choose_scalefac_compress(ahmp3_gr *G, int lsf)
 
 /* ---- Huffman ------------------------------------------------------------------- */
 
-static int region1_start(const ahmp3_gr *G, int sr)
+static inline int region1_start(const ahmp3_gr *G, int sr)
 {
     if (G->window_switching) return G->block_type == 2 ? (sr == 8 ? 72 : 36) : ahmp3_sfb_long[sr][8];
     return ahmp3_sfb_long[sr][G->region0_count + 1];
 }
 
-static int region2_start(const ahmp3_gr *G, int sr)
+static inline int region2_start(const ahmp3_gr *G, int sr)
 {
     if (G->window_switching) return 576;
     int l = G->region0_count + G->region1_count + 2;
     return ahmp3_sfb_long[sr][l > 22 ? 22 : l];
 }
 
-static void region_bounds(const ahmp3_gr *G, int sr, int b[3])
+static inline void region_bounds(const ahmp3_gr *G, int sr, int b[3])
 {
     int big = G->big_values * 2;
     int r1 = region1_start(G, sr), r2 = region2_start(G, sr);
@@ -185,21 +189,6 @@ static void region_bounds(const ahmp3_gr *G, int sr, int b[3])
 
 #define INVALID (1 << 24)
 
-static int pair_bits(int t, int x, int y)
-{
-    const ahmp3_huff *h = &ahmp3_huff_tables[t];
-    if (x < 0) x = -x;
-    if (y < 0) y = -y;
-    int bits = (x != 0) + (y != 0);
-    if (h->linbits) {
-        if (x >= 15) { if (x - 15 >= 1 << h->linbits) return INVALID; bits += h->linbits; x = 15; }
-        if (y >= 15) { if (y - 15 >= 1 << h->linbits) return INVALID; bits += h->linbits; y = 15; }
-    } else if (x >= h->size || y >= h->size) {
-        return INVALID;
-    }
-    return bits + h->lens[x * h->size + y];
-}
-
 static int range_bits(const int *ix, int t, int start, int end)
 {
     if (t == 0) {
@@ -207,46 +196,154 @@ static int range_bits(const int *ix, int t, int start, int end)
             if (ix[j]) return INVALID;
         return 0;
     }
-    if (!ahmp3_huff_tables[t].size) return INVALID;
+    const ahmp3_huff *h = &ahmp3_huff_tables[t];
+    if (!h->size) return INVALID;
+    const unsigned char *lens = h->lens;
+    int sz = h->size;
+    int lb = h->linbits;
     int bits = 0;
-    for (int j = start; j < end; j += 2) {
-        bits += pair_bits(t, ix[j], ix[j + 1]);
-        if (bits >= INVALID) return INVALID;
+    if (!lb) {
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j]; if (x < 0) x = -x;
+            int y = ix[j + 1]; if (y < 0) y = -y;
+            if (x >= sz || y >= sz) return INVALID;
+            bits += (x != 0) + (y != 0) + lens[x * sz + y];
+        }
+    } else {
+        int lim = 15 + (1 << lb);
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j]; if (x < 0) x = -x;
+            int y = ix[j + 1]; if (y < 0) y = -y;
+            bits += (x != 0) + (y != 0);
+            if (x >= 15) { if (x >= lim) return INVALID; bits += lb; x = 15; }
+            if (y >= 15) { if (y >= lim) return INVALID; bits += lb; y = 15; }
+            bits += lens[(x << 4) + y];
+        }
     }
     return bits;
 }
 
-/* The cheapest table for lines [start, end). */
+/* The cheapest table for lines [start, end), scoring all candidate tables
+   in a single pass over the values. */
 static int choose_table(const int *ix, int start, int end, int *bits)
 {
+    if (start >= end) { *bits = 0; return 0; }
     int max = 0;
     for (int j = start; j < end; j++) {
-        int v = ix[j] < 0 ? -ix[j] : ix[j];
+        int v = ix[j];
+        if (v < 0) v = -v;
         if (v > max) max = v;
     }
-    *bits = 0;
-    if (max == 0) return 0;
-    static const int classes[16][3] = {
-        {0}, {1, 0, 0}, {2, 3, 0}, {5, 6, 0}, {7, 8, 9}, {7, 8, 9}, {10, 11, 12}, {10, 11, 12},
-        {13, 15, 0}, {13, 15, 0}, {13, 15, 0}, {13, 15, 0}, {13, 15, 0}, {13, 15, 0}, {13, 15, 0}, {13, 15, 0},
-    };
-    int best = -1, best_bits = INVALID;
-    if (max < 16) {
-        for (int i = 0; i < 3 && classes[max][i]; i++) {
-            int b = range_bits(ix, classes[max][i], start, end);
-            if (b < best_bits) { best_bits = b; best = classes[max][i]; }
+    if (max == 0) { *bits = 0; return 0; }
+
+    /* Non-escape classes: {1}, {2,3}, {5,6}, {7,8,9}, {10,11,12}, {13,15}. */
+    if (max == 1) {
+        const unsigned char *l1 = ahmp3_huff_tables[1].lens;
+        int b1 = 0;
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j] != 0, y = ix[j + 1] != 0;
+            b1 += x + y + l1[(x << 1) + y];
         }
+        *bits = b1;
+        return 1;
     }
-    if (max >= 15) {
-        for (int base = 16; base <= 24; base += 8) {
-            for (int t = base; t < base + 8; t++) {
-                if (max - 15 < 1 << ahmp3_huff_tables[t].linbits) {
-                    int b = range_bits(ix, t, start, end);
-                    if (b < best_bits) { best_bits = b; best = t; }
-                    break;
-                }
-            }
+    if (max <= 3) {
+        int t0 = max == 2 ? 2 : 5;
+        int t1 = max == 2 ? 3 : 6;
+        int sz = ahmp3_huff_tables[t0].size;
+        const unsigned char *l0 = ahmp3_huff_tables[t0].lens;
+        const unsigned char *l1 = ahmp3_huff_tables[t1].lens;
+        int b0 = 0, b1 = 0, signs = 0;
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j]; if (x < 0) x = -x;
+            int y = ix[j + 1]; if (y < 0) y = -y;
+            signs += (x != 0) + (y != 0);
+            int idx = x * sz + y;
+            b0 += l0[idx];
+            b1 += l1[idx];
         }
+        if (b0 <= b1) { *bits = b0 + signs; return t0; }
+        *bits = b1 + signs;
+        return t1;
+    }
+    if (max <= 7) {
+        int t0 = max <= 5 ? 7 : 10;
+        int sz = ahmp3_huff_tables[t0].size;
+        const unsigned char *l0 = ahmp3_huff_tables[t0].lens;
+        const unsigned char *l1 = ahmp3_huff_tables[t0 + 1].lens;
+        const unsigned char *l2 = ahmp3_huff_tables[t0 + 2].lens;
+        int b0 = 0, b1 = 0, b2 = 0, signs = 0;
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j]; if (x < 0) x = -x;
+            int y = ix[j + 1]; if (y < 0) y = -y;
+            signs += (x != 0) + (y != 0);
+            int idx = x * sz + y;
+            b0 += l0[idx];
+            b1 += l1[idx];
+            b2 += l2[idx];
+        }
+        int best = t0, bb = b0;
+        if (b1 < bb) { bb = b1; best = t0 + 1; }
+        if (b2 < bb) { bb = b2; best = t0 + 2; }
+        *bits = bb + signs;
+        return best;
+    }
+    if (max < 15) {
+        const unsigned char *l0 = ahmp3_huff_tables[13].lens;
+        const unsigned char *l1 = ahmp3_huff_tables[15].lens;
+        int b0 = 0, b1 = 0, signs = 0;
+        for (int j = start; j < end; j += 2) {
+            int x = ix[j]; if (x < 0) x = -x;
+            int y = ix[j + 1]; if (y < 0) y = -y;
+            signs += (x != 0) + (y != 0);
+            int idx = (x << 4) + y;
+            b0 += l0[idx];
+            b1 += l1[idx];
+        }
+        if (b0 <= b1) { *bits = b0 + signs; return 13; }
+        *bits = b1 + signs;
+        return 15;
+    }
+
+    /* max >= 15: compare the cheapest linbits table from 16..23 and 24..31
+       (plus 13 and 15 when max == 15) in one pass. */
+    int ta = -1, tb = -1;
+    for (int t = 16; t < 24; t++)
+        if (max - 15 < (1 << ahmp3_huff_tables[t].linbits)) { ta = t; break; }
+    for (int t = 24; t < 32; t++)
+        if (max - 15 < (1 << ahmp3_huff_tables[t].linbits)) { tb = t; break; }
+    if (ta < 0 && tb < 0) { *bits = INVALID; return -1; }
+    const unsigned char *la = ta >= 0 ? ahmp3_huff_tables[ta].lens : NULL;
+    const unsigned char *lb = tb >= 0 ? ahmp3_huff_tables[tb].lens : NULL;
+    int lba = ta >= 0 ? ahmp3_huff_tables[ta].linbits : 0;
+    int lbb = tb >= 0 ? ahmp3_huff_tables[tb].linbits : 0;
+    int ba = 0, bb = 0, signs = 0, esc = 0;
+    int b13 = 0, b15 = 0;
+    const unsigned char *l13 = max == 15 ? ahmp3_huff_tables[13].lens : NULL;
+    const unsigned char *l15 = max == 15 ? ahmp3_huff_tables[15].lens : NULL;
+    for (int j = start; j < end; j += 2) {
+        int x = ix[j]; if (x < 0) x = -x;
+        int y = ix[j + 1]; if (y < 0) y = -y;
+        signs += (x != 0) + (y != 0);
+        if (x >= 15) { esc++; x = 15; }
+        if (y >= 15) { esc++; y = 15; }
+        int idx = (x << 4) + y;
+        if (la) ba += la[idx];
+        if (lb) bb += lb[idx];
+        if (l13) { b13 += l13[idx]; b15 += l15[idx]; }
+    }
+    int best = -1, best_bits = INVALID;
+    if (l13) {
+        if (b13 + signs < best_bits) { best_bits = b13 + signs; best = 13; }
+        if (b15 + signs < best_bits) { best_bits = b15 + signs; best = 15; }
+    }
+    if (la) {
+        int tot = ba + signs + esc * lba;
+        if (tot < best_bits) { best_bits = tot; best = ta; }
+    }
+    if (lb) {
+        int tot = bb + signs + esc * lbb;
+        if (tot < best_bits) { best_bits = tot; best = tb; }
     }
     *bits = best_bits;
     return best;
@@ -255,11 +352,15 @@ static int choose_table(const int *ix, int start, int end, int *bits)
 static int count1_bits(const int *ix, int start, int end, int table)
 {
     int bits = 0;
+    if (table) {
+        for (int j = start; j < end; j += 4)
+            bits += 4 + (ix[j] != 0) + (ix[j + 1] != 0) + (ix[j + 2] != 0) + (ix[j + 3] != 0);
+        return bits;
+    }
     for (int j = start; j < end; j += 4) {
-        int idx = 0, signs = 0;
-        for (int i = 0; i < 4; i++)
-            if (ix[j + i]) { idx |= 8 >> i; signs++; }
-        bits += signs + (table ? 4 : ahmp3_count1_lens[0][idx]);
+        int s0 = ix[j] != 0, s1 = ix[j + 1] != 0, s2 = ix[j + 2] != 0, s3 = ix[j + 3] != 0;
+        int idx = (s0 << 3) | (s1 << 2) | (s2 << 1) | s3;
+        bits += s0 + s1 + s2 + s3 + ahmp3_count1_lens[0][idx];
     }
     return bits;
 }
@@ -287,10 +388,9 @@ int ahmp3_huffman_choose(ahmp3_gr *G, int sr, bool best_split)
     while (end > 0 && !ix[end - 1] && !ix[end - 2]) end -= 2;
     int c1 = end;
     while (c1 >= 4) {
-        bool small = true;
-        for (int i = 1; i <= 4; i++)
-            if (ix[c1 - i] > 1 || ix[c1 - i] < -1) small = false;
-        if (!small) break;
+        if ((unsigned)(ix[c1 - 1] + 1) > 2u || (unsigned)(ix[c1 - 2] + 1) > 2u ||
+            (unsigned)(ix[c1 - 3] + 1) > 2u || (unsigned)(ix[c1 - 4] + 1) > 2u)
+            break;
         c1 -= 4;
     }
     G->big_values = c1 / 2;
@@ -309,13 +409,15 @@ int ahmp3_huffman_choose(ahmp3_gr *G, int sr, bool best_split)
         return bits + t0 + t1;
     }
 
-    /* The usual split for this many bands; the full search below can only
-       improve on it. */
+    /* The usual split for this many bands; the neighborhood search below
+       checks nearby splits to see if any save bits. */
     int big = c1;
     int bands = 0;
     while (bands < 22 && ahmp3_sfb_long[sr][bands] < big) bands++;
-    G->region0_count = subdivision[bands][0];
-    G->region1_count = subdivision[bands][1];
+    int def_r0 = subdivision[bands][0];
+    int def_r1 = subdivision[bands][1];
+    G->region0_count = def_r0;
+    G->region1_count = def_r1;
     int bound[3], start = 0, sum = 0;
     region_bounds(G, sr, bound);
     for (int r = 0; r < 3; r++) {
@@ -326,10 +428,15 @@ int ahmp3_huffman_choose(ahmp3_gr *G, int sr, bool best_split)
     }
     if (!best_split) return bits + sum;
 
-    int best = sum, best_r0 = G->region0_count, best_r1 = G->region1_count;
+    int best = sum, best_r0 = def_r0, best_r1 = def_r1;
     int best_t[3] = {G->table[0], G->table[1], G->table[2]};
-    for (int r0 = 0; r0 < 16; r0++) {
-        for (int r1 = 0; r1 < 8; r1++) {
+    int r0_lo = def_r0 > 2 ? def_r0 - 2 : 0;
+    int r0_hi = def_r0 + 2 < 15 ? def_r0 + 2 : 15;
+    int r1_lo = def_r1 > 2 ? def_r1 - 2 : 0;
+    int r1_hi = def_r1 + 2 < 7 ? def_r1 + 2 : 7;
+    for (int r0 = r0_lo; r0 <= r0_hi; r0++) {
+        for (int r1 = r1_lo; r1 <= r1_hi; r1++) {
+            if (r0 == def_r0 && r1 == def_r1) continue;
             G->region0_count = r0;
             G->region1_count = r1;
             int tb[3], from = 0, total = 0, t[3];
